@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+"""Entry point for the command line and the agent.
+
+The Linux port does not install its modules into dist-packages. They sit in
+one directory, laid out the way the checkout is, because linux/ shadows the
+shared modules at the root by being ahead of them on sys.path - see
+linux/_path.py for why. A bare `import device` in the shared daemon then finds
+the Linux device.py, while `import config` falls through to the shared one.
+Installing the two halves as ordinary packages would lose that ordering.
+
+The same script serves an installed system and a source checkout, so there is
+one thing to run and one thing to point a unit file at:
+
+    /usr/bin/g510                       modules in /usr/share/g510-linux
+    <checkout>/packaging/g510           modules in the checkout
+"""
+import os
+import sys
+
+# Where the .deb puts the modules.
+INSTALLED = "/usr/share/g510-linux"
+
+
+def root():
+    """The directory holding cli.py and linux/, wherever we are running from."""
+    # realpath first: this is often reached through a symlink from ~/.local/bin
+    # or /usr/local/bin, and the answer has to come from the real location.
+    here = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    checkout = os.path.dirname(here)
+    if (os.path.isdir(os.path.join(checkout, "linux"))
+            and os.path.isfile(os.path.join(checkout, "cli.py"))):
+        return checkout
+    return INSTALLED
+
+
+def main():
+    base = root()
+    if not os.path.isfile(os.path.join(base, "cli.py")):
+        sys.exit(f"g510: no modules under {base}; the install is incomplete")
+
+    # Insert the shared root first and the Linux directory second, so that the
+    # Linux one ends up in front of it. This mirrors linux/_path.setup().
+    for path in (base, os.path.join(base, "linux")):
+        if path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
+
+    # Straight to cli, not through main.py: main.py's no-argument path opens
+    # the macOS menu bar app, which is not part of the Linux port.
+    import cli
+    return cli.main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,21 @@
+#!/bin/sh
+# The agent runs in the user's session, so root cannot stop it from here
+# without reaching into a session it does not own. Say what to run instead.
+set -e
+
+case "$1" in
+remove)
+    if [ -d /run/systemd/system ]; then
+        echo "g510-linux: if the agent is running, stop it as your own user:"
+        echo "    systemctl --user disable --now g510.service"
+    fi
+    ;;
+upgrade|deconfigure|failed-upgrade)
+    # Nothing to do on an upgrade: the unit file is replaced in place, and a
+    # restart is the user's call.
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

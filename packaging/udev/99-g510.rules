@@ -1,0 +1,60 @@
+# Logitech G510 - permissions for the userspace driver.
+#
+# The keyboard is 046d:c22d, and 046d:c22e when a headset is plugged into it:
+# attaching the headset makes the device re-enumerate under the second product
+# id, so both have to be matched or the display goes dark when someone plugs
+# their headphones in.
+#
+# Nothing here needs the daemon to be root. It runs as the logged-in user,
+# because it types into that user's session and launches that user's apps.
+
+# -- the LCD and the vendor interface --------------------------------------
+#
+# The 160x43 display is driven by writing HID output report 0x03 to the
+# keyboard's hidraw node, and the backlight is set over the same interface.
+# hidraw nodes are root-only by default.
+#
+# TAG+="uaccess" is the part that normally does the work: logind hands the
+# device to whoever is sitting at the seat, which is right for a keyboard.
+# The GROUP/MODE pair is a fallback for a session logind does not consider
+# active - an ssh login, a bare tty, a display manager that does not register
+# a seat - where uaccess grants nothing at all.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c22d", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c22e", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# -- the backlight and the M-key LEDs --------------------------------------
+#
+# The in-tree hid-lg-g15 driver exposes these as LED class devices named
+# g15::kbd_backlight and g15::macro_preset1..3. Their sysfs attributes are
+# owned by root, so without this the daemon could not change the colour or
+# light an M-key without being root - which is exactly what we are avoiding.
+#
+# The attribute that carries the RGB value is not the same on every kernel:
+#
+#   color             Debian 13's 6.12 kernel, a driver-specific attribute
+#   multi_intensity   mainline, once the driver moved to the multicolor LED
+#   multi_index       class; reads back which channel is which
+#
+# Rather than guess at the kernel, loop over every name and touch the ones
+# that exist. A missing attribute is skipped, and the trailing `exit 0` keeps
+# a skipped file from turning into a failed RUN and a log line on every boot.
+#
+# $devpath is substituted by udev; $$f is a literal $ passed through to the
+# shell, since udev would otherwise try to expand it itself.
+SUBSYSTEM=="leds", KERNEL=="g15::*", ACTION!="remove", RUN+="/bin/sh -c 'for f in brightness color multi_intensity multi_index; do if [ -e /sys$devpath/$$f ]; then chgrp plugdev /sys$devpath/$$f; chmod g+w /sys$devpath/$$f; fi; done; exit 0'"
+
+# -- synthesising key presses ----------------------------------------------
+#
+# A G-key bound to a key chord or to typed text is replayed through
+# /dev/uinput, which is root-only out of the box.
+#
+# Be aware that this is a real privilege, not a formality: any process running
+# as a member of plugdev can create a virtual keyboard and type into whatever
+# currently has focus, and neither Wayland nor X can tell those events from
+# the ones a real keyboard sends. Put only accounts you trust in plugdev, and
+# if that trade is not one you want to make, leave this line out - everything
+# except the keys and text bindings still works without it.
+#
+# static_node= applies the ownership even when the uinput module has not been
+# loaded yet, which is the usual state on a machine that has not used it.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", OPTIONS+="static_node=uinput"

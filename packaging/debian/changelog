@@ -1,0 +1,6 @@
+g510-linux (0.1.0) trixie; urgency=low
+
+  * Initial package for the Linux port: the LCD, the G-key bindings and the
+    macro recorder, on top of what hid-lg-g15 already provides.
+
+ -- Paul <paulloth2208@gmail.com>  Sat, 19 Sep 2026 21:40:10 +0200

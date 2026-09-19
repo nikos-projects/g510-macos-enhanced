@@ -1,0 +1,20 @@
+#!/bin/sh
+# The rules file is gone by the time this runs, so tell udev to forget it.
+set -e
+
+case "$1" in
+remove|purge)
+    if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=hidraw --subsystem-match=leds || true
+    fi
+    ;;
+esac
+
+# Nothing is removed from anyone's home directory, on purge either. The
+# configuration, the bindings and the recorded macros live in ~/.config/g510
+# and belong to the user, not to the package.
+
+#DEBHELPER#
+
+exit 0

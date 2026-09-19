@@ -1,0 +1,53 @@
+#!/bin/sh
+# Two things the package cannot do for the user, and says so instead of
+# guessing: enabling a user unit, and handing out group membership.
+set -e
+
+case "$1" in
+configure)
+    # Apply the new rules to devices that are already plugged in. Without the
+    # trigger the keyboard would only become usable after a replug or a
+    # reboot. Both are best-effort: in a chroot or a container there is no
+    # udev running and neither has anything to do.
+    if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=hidraw --subsystem-match=leds || true
+    fi
+
+    # Who ran this, as best as can be told from an apt or a pkexec invocation.
+    user="${SUDO_USER:-}"
+    if [ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        user="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)" || user=""
+    fi
+
+    if ! getent group plugdev >/dev/null 2>&1; then
+        echo "g510-linux: there is no plugdev group on this system."
+        echo "  The udev rules fall back to it for sessions logind does not"
+        echo "  treat as active, and /dev/uinput needs it. Create it with:"
+        echo "    sudo groupadd -r plugdev"
+    fi
+
+    # Deliberately not `usermod -aG plugdev`. Membership of plugdev is what
+    # allows a process to open /dev/uinput and type into the session, which is
+    # a privilege worth granting on purpose rather than as a side effect of
+    # installing a package.
+    if [ -n "$user" ] && ! id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx plugdev; then
+        echo "g510-linux: $user is not in the plugdev group."
+        echo "  The display and the backlight will still work through logind's"
+        echo "  uaccess tag, but bindings that type keys or text need it:"
+        echo "    sudo usermod -aG plugdev $user"
+        echo "  Group changes take effect at the next login."
+    fi
+
+    echo "g510-linux: start the agent as your own user, not as root:"
+    echo "    systemctl --user daemon-reload"
+    echo "    systemctl --user enable --now g510.service"
+    ;;
+
+abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0
