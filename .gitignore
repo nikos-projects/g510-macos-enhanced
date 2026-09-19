@@ -5,3 +5,6 @@ __pycache__/
 build/
 dist/
 build-venv/
+*.deb
+*.buildinfo
+*.changes
