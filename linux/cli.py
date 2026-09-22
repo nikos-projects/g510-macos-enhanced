@@ -291,7 +291,8 @@ USAGE = """g510 - control a Logitech G510 keyboard on Linux
   g510 mkeys [m1 m2 m3 mr]      light M-key LEDs (no args clears them)
   g510 watch [--raw]            print G-key presses live
 
-  g510 lcd <screen>             draw a screen once: clock status gkeys app
+  g510 lcd <screen>             one screen: status clock claude media
+                                printer gauge gkeys
   g510 lcd text "a" "b" "c"     draw up to 3 lines of text
   g510 lcd clear                blank the display
   g510 next                     step to the next screen in the cycle
