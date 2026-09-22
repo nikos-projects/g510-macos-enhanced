@@ -10,3 +10,5 @@ udev/99-g510.rules      lib/udev/rules.d
 systemd/g510.service    usr/lib/systemd/user
 
 g510                    usr/bin
+
+g510.desktop            usr/share/applications

@@ -22,6 +22,7 @@ out of read_raw(), so daemon.py and control.py import it unchanged.
 """
 import os
 import select
+import time
 
 VENDOR_ID = 0x046D
 PRODUCT_IDS = (0xC22D, 0xC22E)   # G510, G510 with onboard audio
@@ -477,6 +478,24 @@ class G510:
                       (self._bits >> 8) & 0xFF,
                       (self._bits >> 16) & 0xFF,
                       self._lcd_bits])
+
+    def wait(self, timeout):
+        """Block until a key moves or `timeout` expires. Returns True if a key.
+
+        The macOS side has to poll, because hidapi gives it nothing to wait
+        on. Here the kernel already decoded the report into an evdev device
+        with a file descriptor, so the agent can sleep on it instead of waking
+        250 times a second to ask. That is both less work and less latency: a
+        G-key now wakes the loop immediately rather than up to a poll apart.
+        """
+        try:
+            keys = self._gaming_keys()
+        except OSError:
+            # No evdev: fall back to sleeping, so a missing python3-evdev
+            # degrades the agent to the macOS cadence rather than spinning.
+            time.sleep(timeout)
+            return False
+        return bool(select.select([keys.fd], [], [], timeout)[0])
 
     @staticmethod
     def carries_keystrokes(data):

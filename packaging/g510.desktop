@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=G510
+GenericName=Keyboard Control
+Comment=Backlight, G-key bindings and the display on a Logitech G510
+# No --tray: someone picking this out of the launcher wants the window. The
+# tray icon appears alongside it either way, and survives the window closing.
+Exec=g510 gui
+TryExec=g510
+Icon=input-keyboard
+Terminal=false
+Categories=Settings;HardwareSettings;Qt;
+Keywords=keyboard;logitech;g510;backlight;macro;lcd;
+StartupNotify=true

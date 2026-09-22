@@ -16,7 +16,9 @@ Depends: ${misc:Depends},
          python3-evdev,
          python3-pil
 Recommends: playerctl,
-            wtype
+            wtype,
+            python3-pyside6.qtwidgets,
+            python3-pyside6.qtsvg
 Description: userspace driver for the Logitech G510 keyboard
  Drives the parts of a Logitech G510 that the kernel leaves alone. The in-tree
  hid-lg-g15 driver already exposes the RGB backlight, the M-key LEDs and the

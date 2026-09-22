@@ -252,10 +252,19 @@ def cmd_install(_args):
         print(f'  echo \'export PATH="$HOME/.local/bin:$PATH"\' >> ~/.bashrc')
 
 
-def cmd_gui(_args):
-    """There is no GUI here, and saying so beats an ImportError about AppKit."""
-    sys.exit("The menu bar app is macOS only; on Linux the CLI covers "
-             "everything the agent exposes. See g510 --help.")
+def cmd_gui(args):
+    """Open the Qt window, or the tray alone with --tray.
+
+    Imported here rather than at the top of the file so the command line keeps
+    working on a machine with no Qt on it. PySide6 is a Recommends, not a
+    Depends, because the agent and the CLI have no use for it.
+    """
+    try:
+        import gui
+    except ImportError as exc:
+        sys.exit(f"{exc}\n"
+                 "  apt install python3-pyside6.qtwidgets python3-pyside6.qtsvg")
+    sys.exit(gui.main(args))
 
 
 # cmd_iso is deliberately not overridden. It already wraps control.iso_swap in
@@ -313,6 +322,7 @@ USAGE = """g510 - control a Logitech G510 keyboard on Linux
 
   g510 start | stop | status    the agent, as a systemd user service
   g510 run                      run the agent in the foreground (ctrl-C stops)
+  g510 gui [--tray]             the window, or just the tray icon
 
 colours: """ + ", ".join(sorted(config.NAMED_COLORS))
 

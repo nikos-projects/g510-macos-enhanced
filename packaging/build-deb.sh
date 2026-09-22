@@ -59,6 +59,8 @@ if [ -n "$missing" ]; then
     install -m 755 "$HERE/g510" "$stage/usr/bin/g510"
     install -m 644 "$HERE/udev/99-g510.rules" "$stage/lib/udev/rules.d/"
     install -m 644 "$HERE/systemd/g510.service" "$stage/usr/lib/systemd/user/"
+    install -d "$stage/usr/share/applications"
+    install -m 644 "$HERE/g510.desktop" "$stage/usr/share/applications/"
     install -m 644 "$TOP/linux/README.md" "$stage/usr/share/doc/g510-linux/"
     install -m 644 "$HERE/debian/copyright" "$stage/usr/share/doc/g510-linux/"
     # Debian policy wants the changelog installed and compressed.
@@ -82,7 +84,7 @@ if [ -n "$missing" ]; then
         echo "Architecture: all"
         echo "Maintainer: Paul <paulloth2208@gmail.com>"
         echo "Depends: python3, python3-evdev, python3-pil"
-        echo "Recommends: playerctl, wtype"
+        echo "Recommends: playerctl, wtype, python3-pyside6.qtwidgets, python3-pyside6.qtsvg"
         sed -n '/^Description:/,$p' "$HERE/debian/control"
     } > "$stage/DEBIAN/control"
 
