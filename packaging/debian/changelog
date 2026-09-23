@@ -1,3 +1,15 @@
+g510-linux (0.1.1) trixie; urgency=low
+
+  * Sleep on the keyboard's evdev descriptor instead of polling it every four
+    milliseconds. Measured against the hardware: 4.4% of a core down to 0.00%,
+    and a G-key now wakes the agent at once rather than up to a poll later.
+  * Add the Qt tray and window, reached with `g510 gui`, plus a desktop entry.
+    PySide6 is a Recommends: the agent and the command line do not need it.
+  * Stop calling refresh_app_color, which was a no-op on Wayland running two
+    hundred and fifty times a second.
+
+ -- Paul <paulloth2208@gmail.com>  Wed, 23 Sep 2026 19:40:00 +0200
+
 g510-linux (0.1.0) trixie; urgency=low
 
   * Initial package for the Linux port: the LCD, the G-key bindings and the
