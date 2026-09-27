@@ -232,6 +232,9 @@ class Daemon:
         if mode_keys is not None:
             for name in sorted(mode_keys - self.mode_pressed):
                 self.fire_mode_key(name)
+                self.broadcast({"event": "press", "key": name})
+            for name in sorted(self.mode_pressed - mode_keys):
+                self.broadcast({"event": "release", "key": name})
             for name in sorted(self.mode_pressed - mode_keys):
                 if name == "GAME":
                     self.fire_game_switch(False)

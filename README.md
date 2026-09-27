@@ -128,7 +128,15 @@ the display, or give it a binding object to run anything a G-key can.
 
 ## Installing
 
-Download `G510.dmg`, drag the app to Applications, open it. It lives in the
+Download the latest `G510.dmg` from
+[Releases](https://github.com/paulloth1/g510-macos/releases/latest), drag the
+app to Applications, and open it.
+
+Because it is ad-hoc signed rather than notarised, macOS refuses it on first
+open. Right-click the app and choose Open, or clear the quarantine flag:
+
+    xattr -d com.apple.quarantine /Applications/G510.app
+ It lives in the
 menu bar; there is no Dock icon. Configuration is on its menu.
 
 The bundle is self-contained - the interpreter, the Python modules and the

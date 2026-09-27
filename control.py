@@ -162,20 +162,29 @@ def watch_gkeys():
     except OSError as exc:
         raise ControlError(f"Could not open the keyboard ({exc})")
     keyboard.set_nonblocking(True)
-    pressed = set()
+    # Every group the macro report carries, not just the G-keys: the mode keys
+    # and the keys around the display arrive in the same report, and a caller
+    # watching for a key press means any of them.
+    decoders = (device.G510.decode_gkeys,
+                device.G510.decode_mode_keys,
+                device.G510.decode_lcd_keys)
+    pressed = [set() for _ in decoders]
     try:
         while True:
             data = keyboard.read_raw()
             if data:
                 if device.G510.carries_keystrokes(data):
                     continue          # never surface what the user typed
-                keys = device.G510.decode_gkeys(data)
-                if keys is not None:
-                    for name in sorted(keys - pressed):
-                        yield {"event": "press", "key": name, "raw": data.hex()}
-                    for name in sorted(pressed - keys):
+                for index, decode in enumerate(decoders):
+                    keys = decode(data)
+                    if keys is None:
+                        continue
+                    for name in sorted(keys - pressed[index]):
+                        yield {"event": "press", "key": name,
+                               "raw": data.hex()}
+                    for name in sorted(pressed[index] - keys):
                         yield {"event": "release", "key": name}
-                    pressed = keys
+                    pressed[index] = keys
             time.sleep(0.004)
     finally:
         keyboard.close()
