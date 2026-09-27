@@ -21,17 +21,36 @@ keyd 2.5 added a third field that distinguishes the nodes. Get the exact id
 from `keyd monitor` (Debian calls the binary `keyd.rvaiya`) and use all three
 fields, for the *main keyboard node only*.
 
-**Non-ASCII needs the compose file.** keyd cannot type a character the active
-layout does not contain, so for `ä` it emits `Cancel` plus three base36 keys
-and relies on `/usr/share/keyd/keyd.compose` to turn that back into the
-character. Without it you get a literal `02s`. Put this in `~/.XCompose`:
+**Non-ASCII needs compose sequences written out, not included.** keyd cannot
+type a character the active layout does not contain, so for `ä` it emits
+`Cancel` plus three base36 keys and leaves `~/.XCompose` to turn that back
+into the character. Without it you get a literal `02s`.
 
-    include "%L"
-    include "/usr/share/keyd/keyd.compose"
+keyd documents including its own table. Do not:
+
+    include "/usr/share/keyd/keyd.compose"      # Qt only
+
+Qt honours that include and GTK does not, so Kate types `ä` while Firefox
+types `02s` - which reads as "umlauts are broken" while a test in the wrong
+toolkit says they are fine. keyd's manual warns separately that GTK4 crashes
+on XCompose files that large.
+
+Both toolkits read sequences written out in the file, so `make-compose.py`
+emits only the ones the layouts in use can produce - 77 for de+gb:
+
+    echo 'include "%L"' > ~/.XCompose
+    ./make-compose.py de gb >> ~/.XCompose
 
 `include "%L"` first keeps every ordinary compose sequence working.
 
-Check it resolves before trusting it - xkbcommon is the library Qt uses:
+**Debian's `layouts/de` has a corrupt shift layer.** Its `[` key - Ü on a
+German board - is a carriage return rather than Ü, so shift+ü acts as Enter.
+`layouts/de-fixed` is that file with the one line corrected, and `install.sh`
+puts it beside the shipped layouts, because keyd only documents resolving
+includes from `/usr/share/keyd/layouts`.
+
+Check compose in **both** toolkits before believing it. xkbcommon, which is
+what Qt uses, answering correctly says nothing about GTK:
 
     python3 -c "
     from xkbcommon import xkb
