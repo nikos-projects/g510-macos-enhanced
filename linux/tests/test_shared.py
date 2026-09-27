@@ -12,6 +12,11 @@ under their bare names, the root test modules' own imports find them there and
 never consult sys.path at all. Then the TestCase subclasses are copied into
 this module so pytest collects them.
 
+test_control.py arrived with the v1.0.0 line, after the port was written; it
+passes here unchanged, which is worth keeping true - control.py is shimmed on
+Linux, so a change to it is exactly the kind of thing that would break
+quietly.
+
 tests/test_config.py is deliberately not among them. Its assertions name the
 macOS defaults ("Safari", "Terminal"), which linux/config.py replaces by
 design, so it is a test of the root defaults rather than of shared logic.
@@ -32,7 +37,7 @@ import lcd         # noqa: E402,F401
 import printer     # noqa: E402,F401
 import screens     # noqa: E402,F401
 
-PORTABLE = ("test_screens", "test_printer")
+PORTABLE = ("test_screens", "test_printer", "test_control")
 
 
 def _load(name):
