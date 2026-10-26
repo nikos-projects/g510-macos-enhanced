@@ -1,0 +1,1690 @@
+"""Background agent: owns the keyboard, dispatches G-keys, drives the LCD.
+
+hidapi takes the HID device exclusively, so while this runs it holds the only
+handle. The CLI and GUI reach the keyboard by asking this process over a unix
+socket (see ipc.py and control.py).
+
+The keyboard lives on a dock, so it can vanish and come back at any time. A
+missing device is treated as a normal state, not an error.
+"""
+import queue
+import signal
+import sys
+import threading
+import time
+
+import actions
+import alerts
+import autoscreen
+import config
+import device
+import ipc
+import keytap
+import lcd
+import link
+import menu
+import notify
+import recorder
+import screens
+import timers
+import triggers
+
+RECONNECT_DELAY = 2.0
+POLL_INTERVAL = 0.004
+APP_CHECK_INTERVAL = 0.75
+
+# Display keys are pressed in patterns, not just pressed. One press waits to
+# see whether more are coming, because three of L5 have to be able to mean a
+# note without the single press firing twice on the way there; two of a soft
+# key freeze the screen where it is; and a key held down means something a
+# tap never could - a held L2 is the settings menu, open or shut. Everything
+# else a key is set to do happens when its window closes.
+#
+# Two windows, and they are deliberately different lengths:
+#
+#   GESTURE_HOLD  when a press's own action runs - short, so a single press
+#                 still answers almost straight away;
+#   GESTURE_SPAN  how long the *count* of presses lives. A triple tapped at
+#                 an easy pace has gaps longer than the hold, so counting
+#                 has to outlive the action it promised, or the second
+#                 window was the first one in disguise and every relaxed
+#                 triple was really three lone presses.
+#
+# A hold is not a third window - it is the key still being down, which the
+# loop already reads off every report, so it costs a deadline and no counter.
+# It takes the press's own action away while it lasts as well: a menu
+# arriving on top of the screen change that carried it there would be two
+# answers to one gesture, and the second would hide the first.
+GESTURE_SPAN = 0.7          # presses closer together than this are one gesture
+GESTURE_HOLD = 0.45         # how long one or two presses wait before firing
+HOLD_SECONDS = 0.5          # a key down this long is a hold, not a tap
+DOUBLE_KEYS = ("L2", "L3", "L4", "L5")     # twice: freeze the screen (E1)
+HOLD_KEYS = {"L2": "menu"}  # held: the settings menu, open or shut (E2)
+# Three times: L5 writes a note (E3), L3 brings up the Discord screen (P6).
+TRIPLE_KEYS = {"L5": "note", "L3": "discord"}
+MENU_IDLE = 30.0            # a menu nobody touches closes itself
+NOTE_IDLE = 30.0            # typing a note nobody finishes abandons it
+NOTE_MAX = 240              # how long a sticky note may be
+
+
+def _find_channel(channels, wanted):
+    """Which channel a name on a command line means, or why not.
+
+    A name here is whatever the panel could fit - nine characters of a
+    channel that may also be carrying its server - so it is matched as an
+    id, then exactly, then as a prefix of either the whole name or its last
+    part. An ambiguous name is refused with the candidates instead of
+    picking one of them.
+    """
+    if not wanted:
+        return "no channel given - try: g510 discord channels"
+    word = wanted.lower()
+
+    def keys(entry):
+        name = str(entry.get("name") or "").lower()
+        return {name, name.rsplit(" ", 1)[-1]}
+
+    def named(entries):
+        return ", ".join(str(entry.get("name") or entry.get("id"))
+                         for entry in entries[:6])
+
+    exact = [entry for entry in channels
+             if str(entry.get("id")) == wanted or word in keys(entry)]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return f"{wanted!r} matches more than one channel: {named(exact)}"
+    partial = [entry for entry in channels
+               if any(key.startswith(word) for key in keys(entry))]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        return f"no channel matches {wanted!r} - try: g510 discord channels"
+    return (f"{wanted!r} matches {len(partial)} channels: "
+            f"{named(partial)} - give more of the name")
+
+
+class MenuHost:
+    """The agent's side of the on-screen menu.
+
+    The menu reads `settings` - the agent's live config - and hands its
+    changes to `save` as a change rather than as a result, so they can be
+    applied to a freshly read copy. The CLI and the GUI write the same
+    file, and a menu that saved its own copy would roll their work back.
+    `act` covers the rest: the things only this process can do, because it
+    holds the keyboard and the countdowns.
+    """
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+
+    @property
+    def settings(self):
+        return self.daemon.config
+
+    def save(self, apply=None):
+        return self.daemon.save_config_change(apply)
+
+    def act(self, name, arg=None):
+        return self.daemon.menu_action(name, arg)
+
+
+class Daemon:
+    def __init__(self):
+        self.config = config.load()
+        lcd.set_font((self.config.get("lcd") or {}).get("font"))
+        self.keyboard = None
+        self.running = True
+        self.state = {}
+        self.pressed = set()
+        self.lcd_pressed = set()
+        self.mode_pressed = set()
+        self.leds = None
+        self.last_leds = 0.0
+        self.record_state = None       # None | "await_key" | "recording"
+        self.record_target = None
+        self.recorder = None
+        self.last_lcd = 0.0
+        self.last_app_check = 0.0
+        self.current_app = None
+        self.autoscreen = autoscreen.AutoScreen()
+        # The user's own triggers ride on the same reader, so one read of
+        # "what is happening" answers both halves of the policy.
+        self.triggers = triggers.Triggers(reader=self.autoscreen.reader)
+        self.alerts = alerts.Alerts()
+        self.timers = timers.STORE
+        self.alerting = False          # whether an alert has the display
+        self.watcher = None            # the chat reader, once it is wanted
+        self.link = None               # the Vencord plugin's server, once up
+        self.base_color = config.effective_color(self.config)
+        # Reentrant: a socket command already holds this when it reaches
+        # select_bank, which takes it again via show_bank_led.
+        self.lock = threading.RLock()     # guards every device touch
+        self.config_lock = threading.Lock()   # serialises load/apply/save
+        self.record_lock = threading.Lock()   # guards the recorder handoff
+        self.watchers = []
+        self.watchers_lock = threading.Lock()
+        self.server = ipc.Server(self.handle_request)
+        # What a binding can ask for that the agent itself has to do: a
+        # timer starts here because only this process holds the countdown.
+        self.hooks = {"timer": self.fire_timer}
+        # The menu on the panel. Its host reads the config straight off
+        # `self`, so what the menu draws is what the agent is running.
+        self.menu = menu.Menu(MenuHost(self))
+        self.menu_touch = 0.0        # the last key the menu was given
+        self.menu_typing = False     # a text field is being typed into
+        self.keytap = None           # started the first time the menu opens
+        # The menu is moved by the poll loop (keys the tap took) and by the
+        # socket (`g510 menu key ...`) at the same time, so one lock owns
+        # every mutation of it. Reentrant: an action can close the menu
+        # from inside the press that asked for it.
+        self.menu_lock = threading.RLock()
+        # One entry per display key: how many presses, when, and what the
+        # gesture is currently promising to do when its window closes.
+        # `[count, last, due, pending]` - see note_gesture.
+        self._gestures = {}
+        # A sticky note (E3): `note` is what is pinned, `note_draft` what
+        # is being typed. Runtime state on purpose - it is a thing on the
+        # screen, not a setting, so nothing in the config knows about it.
+        self.note = None
+        self.note_draft = None
+        self.note_touch = 0.0
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def stop(self, *_args):
+        self.running = False
+
+    def connect(self):
+        try:
+            keyboard = device.G510()
+            keyboard.set_nonblocking(True)
+        except (device.DeviceNotFound, OSError):
+            return False
+        # Publish and set up under the lock, so a socket thread cannot reach
+        # a half-configured handle.
+        with self.lock:
+            self.keyboard = keyboard
+            try:
+                keyboard.silence_gkey_scancodes()
+            except OSError as exc:
+                log(f"could not silence G-key scancodes: {exc}")
+            if self.config.get("restore_backlight_on_start", True):
+                keyboard.set_backlight(self.base_color)
+            self.show_bank_led()
+        self.state = {}
+        log("connected to G510")
+        return True
+
+    def drop(self, reason):
+        """Let go of the keyboard. Holds the lock: a socket thread may be
+        part way through a call on the handle we are about to close."""
+        log(f"lost keyboard ({reason}); waiting for it to come back")
+        with self.lock:
+            keyboard, self.keyboard = self.keyboard, None
+            try:
+                if keyboard:
+                    keyboard.close()
+            except Exception:
+                pass
+        self.pressed = set()
+        self.lcd_pressed = set()
+        self.mode_pressed = set()
+        self.leds = None
+        self.last_leds = 0.0
+
+    # -- control socket ----------------------------------------------------
+
+    def handle_request(self, payload):
+        """Yield reply dicts for one client request."""
+        command = payload.get("cmd")
+        if command == "watch":
+            yield from self.stream_gkeys()
+            return
+        try:
+            reply = self.run_command(command, payload)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            yield {"ok": False, "error": str(exc)}
+            return
+        # Commands that touch the config file run outside the device lock,
+        # so a save cannot stall G-key polling.
+        deferred = reply.pop("deferred", None)
+        try:
+            if deferred == "reload":
+                self.reload_config()
+            elif deferred == "next_screen":
+                reply["screen"] = self.advance_screen(1)
+            elif deferred == "set_bank":
+                reply["bank"] = self.select_bank(reply["bank"])
+        except (OSError, ValueError, KeyError) as exc:
+            yield {"ok": False, "error": str(exc)}
+            return
+        yield reply
+
+    def reload_config(self):
+        """Re-read the config and re-apply everything it drives."""
+        self.config = config.load()
+        lcd.set_font((self.config.get("lcd") or {}).get("font"))
+        self.base_color = config.effective_color(self.config)
+        if self.config.get("restore_backlight_on_start", True):
+            with self.lock:
+                if self.keyboard is not None:
+                    self.keyboard.set_backlight(self.active_color())
+        self.show_bank_led()
+        self.sync_watcher()
+        self.sync_link()
+
+    def sync_watcher(self):
+        """The readers follow `notifications.enabled`, and the config.
+
+        Both of them live in this one watcher - the window reader and the
+        store reader - so the switch is the whole alerts channel's, not one
+        source's.
+        """
+        block = self.config.get("notifications") or {}
+        wanted = bool(block.get("enabled", True))
+        if wanted and self.watcher is None:
+            self.watcher = notify.Watcher(block, log=log)
+            self.watcher.start()
+        elif not wanted and self.watcher is not None:
+            watcher, self.watcher = self.watcher, None
+            watcher.stop()
+        elif self.watcher is not None:
+            # The config came back as a new dict on every reload, so the
+            # watcher is pointed at the current one rather than restarted -
+            # restarting would drop whatever it had already learned.
+            self.watcher.block = block
+            self.watcher.reader.block = block
+            self.watcher.banners.block = block
+
+    def sync_link(self):
+        """The plugin's server follows `vencord.enabled`, and its port.
+
+        Only a port that actually changed restarts it - repointing the block
+        is enough for everything else - and a port that is already taken is
+        a state rather than a reason to stop the agent: `Link.start` records
+        it and everything else carries on without it.
+        """
+        block = self.config.get("vencord") or {}
+        if not block.get("enabled", True):
+            if self.link is not None:
+                self.link.stop()
+                self.link = None
+            return
+        try:
+            port = int(block.get("port", link.DEFAULT_PORT) or
+                       link.DEFAULT_PORT)
+        except (TypeError, ValueError):
+            port = link.DEFAULT_PORT
+        if self.link is not None and self.link.port == port:
+            self.link.block = block
+            return
+        if self.link is not None:
+            self.link.stop()
+        self.link = link.Link(block, log=log).start()
+
+    def run_command(self, command, payload):
+        if command == "timer":
+            # Counting down needs the agent, not the keyboard: a timer can be
+            # started, listed or cancelled with the keyboard unplugged.
+            return self.timer_command(payload)
+        if command == "trigger":
+            # Firing one borrows the display, which also needs no keyboard.
+            return self.trigger_command(payload)
+        if command == "menu":
+            # The menu is the panel's own: it opens and moves whether or
+            # not the keyboard is plugged in.
+            return self.menu_command(payload)
+        if command == "note":
+            # So is a sticky note - it is a thing on the screen, and the
+            # screen is what this process owns.
+            return self.note_command(payload)
+        if command == "vencord":
+            # The Discord screen is fed by this process's own localhost
+            # server, which no keyboard and no config file has a say in.
+            return self.vencord_command(payload)
+        if command == "autoscreen":
+            # The freeze lives here, not in the config file, so this is the
+            # only place that can answer for it.
+            return self.autoscreen_command(payload)
+        with self.lock:
+            if self.keyboard is None:
+                return {"ok": False, "error": "keyboard not connected"}
+            if command == "get_backlight":
+                return {"ok": True, "rgb": list(self.keyboard.get_backlight())}
+            if command == "set_backlight":
+                rgb = tuple(payload["rgb"])
+                self.keyboard.set_backlight(rgb)
+                self.base_color = rgb
+                return {"ok": True}
+            if command == "get_config":
+                return {"ok": True, "active_bank":
+                        str(self.config.get("active_bank", "1"))}
+            if command == "set_power_on":
+                self.keyboard.set_power_on_backlight(tuple(payload["rgb"]))
+                return {"ok": True}
+            if command == "set_mkeys":
+                self.keyboard.set_mkeys(payload.get("names", []))
+                return {"ok": True}
+            if command == "send_lcd":
+                frame = bytes.fromhex(payload["frame"])
+                if len(frame) != device.LCD_FRAME_LEN:
+                    return {"ok": False,
+                            "error": f"frame must be {device.LCD_FRAME_LEN} bytes"}
+                self.keyboard._dev.write(frame)
+                return {"ok": True}
+            if command == "silence_gkeys":
+                self.keyboard.silence_gkey_scancodes()
+                return {"ok": True}
+            if command == "clear_lcd":
+                self.keyboard.clear_lcd()
+                return {"ok": True}
+            if command == "info":
+                return {"ok": True,
+                        "manufacturer": self.keyboard._dev.get_manufacturer_string(),
+                        "product": self.keyboard._dev.get_product_string()}
+            if command == "reload":
+                return {"ok": True, "deferred": "reload"}
+            if command == "next_screen":
+                return {"ok": True, "deferred": "next_screen"}
+            if command == "set_bank":
+                return {"ok": True, "deferred": "set_bank",
+                        "bank": str(payload["bank"])}
+            return {"ok": False, "error": f"unknown command {command!r}"}
+
+    def timer_command(self, payload):
+        """What `g510 timer ...` asks the agent to do."""
+        action = str(payload.get("action") or "list")
+        block = self.config.get("timers") or {}
+        if action == "list":
+            return {"ok": True, "timers": self.timers.running(),
+                    "presets": dict(block.get("presets") or {}),
+                    "enabled": bool(block.get("enabled", True)),
+                    "show_seconds": block.get("show_seconds", 10),
+                    "ack_seconds": block.get("ack_seconds", 2.5),
+                    "sound": block.get("sound", "")}
+        if action == "start":
+            if not block.get("enabled", True):
+                return {"ok": False,
+                        "error": "timers are off - turn them on: g510 timer on"}
+            try:
+                seconds = timers.resolve(payload.get("value"),
+                                         block.get("presets"))
+            except (timers.DurationError, ValueError) as exc:
+                return {"ok": False, "error": str(exc)}
+            item = self.start_timer(seconds,
+                                    label=str(payload.get("label") or ""),
+                                    name=str(payload.get("name") or ""))
+            return {"ok": True, "timer": item,
+                    "timers": self.timers.running()}
+        if action == "cancel":
+            gone = self.timers.cancel(payload.get("value"))
+            if not gone:
+                return {"ok": False,
+                        "error": f"no timer {payload.get('value')!r} is running"}
+            return {"ok": True, "cancelled": gone,
+                    "timers": self.timers.running()}
+        return {"ok": False, "error": f"unknown timer action {action!r}"}
+
+    def start_timer(self, seconds, label="", name=""):
+        """Count down from `seconds`, and say so on the display straight
+        away - a key pressed with a game in front needs an answer now."""
+        block = self.config.get("timers") or {}
+        item = self.timers.start(seconds, label=label, name=name)
+        self.alerts.push("timeralert", self._timer_data("started", item),
+                         float(block.get("ack_seconds", 2.5) or 0))
+        log(f"timer {timers.left(seconds)} started"
+            + (f" for {label}" if label else ""))
+        return item
+
+    def fire_timer(self, binding):
+        """A `timer` binding on a G-key, a soft key or the game switch."""
+        block = self.config.get("timers") or {}
+        if not block.get("enabled", True):
+            log("timer ignored - timers are off (g510 timer on)")
+            return
+        try:
+            seconds = timers.duration_for(binding, block.get("presets"))
+        except (timers.DurationError, ValueError) as exc:
+            log(f"timer: {exc}")
+            return
+        label = str(binding.get("label") or "")
+        name = str(binding.get("preset") or "")
+        self.start_timer(seconds, label=label, name=name)
+
+    def _timer_data(self, phase, item):
+        return {"phase": phase, "label": item.get("label") or "",
+                "name": item.get("name") or "",
+                "seconds": float(item.get("seconds") or 0),
+                "until": float(item.get("until") or 0)}
+
+    def _message_data(self, event):
+        """An alert from the chat reader, in the shape the screen draws."""
+        if event.get("kind") == "unread":
+            count = int(event.get("count") or 0)
+            return {"app": event.get("app") or "Discord",
+                    "channel": event.get("channel") or "",
+                    "author": "", "text": f"{count} unread",
+                    "title": event.get("title") or "", "time": ""}
+        return {"app": event.get("app") or "Discord",
+                "channel": event.get("channel") or "",
+                "author": event.get("author") or "",
+                "text": event.get("text") or "",
+                "title": "", "time": event.get("time") or ""}
+
+    def stream_gkeys(self):
+        """Feed G-key events to one watching client until it disconnects."""
+        events = queue.Queue(maxsize=256)
+        with self.watchers_lock:
+            self.watchers.append(events)
+        try:
+            while self.running:
+                try:
+                    yield events.get(timeout=1.0)
+                except queue.Empty:
+                    yield {"event": "ping"}
+        finally:
+            with self.watchers_lock:
+                if events in self.watchers:
+                    self.watchers.remove(events)
+
+    def broadcast(self, message):
+        """Fan out to watchers, dropping for any client that stopped reading."""
+        with self.watchers_lock:
+            for events in self.watchers:
+                try:
+                    events.put_nowait(message)
+                except queue.Full:
+                    pass
+
+    # -- work --------------------------------------------------------------
+
+    # How many input reports one pass may chew through. The queue is drained
+    # rather than sampled: reading one report per pass lets a busy keyboard
+    # - somebody typing while a triple press is landing - build a backlog,
+    # and the OS drops from the front of its queue once it is full, which is
+    # how a key press goes missing without a trace. The bound keeps a device
+    # that never stops sending from starving the rest of the loop.
+    REPORT_BURST = 64
+
+    def handle_gkeys(self):
+        with self.lock:
+            reports = []
+            while len(reports) < self.REPORT_BURST:
+                data = self.keyboard.read_raw()
+                if data is None:
+                    break
+                reports.append(data)
+        for report in reports:
+            self.handle_report(report)
+
+    def handle_report(self, data):
+        # Raw reports go out so unknown buttons can be mapped, but never the
+        # boot-keyboard report - that is the user's actual typing.
+        if not device.G510.carries_keystrokes(data):
+            self.broadcast({"event": "raw", "raw": data.hex()})
+        keys = device.G510.decode_gkeys(data)
+        if keys is None:
+            return
+        for name in sorted(keys - self.pressed):
+            if self.record_state == "await_key":
+                self.start_recording(name)
+            else:
+                self.fire(name)
+            self.broadcast({"event": "press", "key": name, "raw": data.hex()})
+        for name in sorted(self.pressed - keys):
+            self.broadcast({"event": "release", "key": name})
+        self.pressed = keys
+
+        mode_keys = device.G510.decode_mode_keys(data)
+        if mode_keys is not None:
+            for name in sorted(mode_keys - self.mode_pressed):
+                self.fire_mode_key(name)
+                self.broadcast({"event": "press", "key": name})
+            for name in sorted(self.mode_pressed - mode_keys):
+                self.broadcast({"event": "release", "key": name})
+            for name in sorted(self.mode_pressed - mode_keys):
+                if name == "GAME":
+                    self.fire_game_switch(False)
+            self.mode_pressed = mode_keys
+
+        lcd_keys = device.G510.decode_lcd_keys(data)
+        if lcd_keys is not None:
+            for name in sorted(lcd_keys - self.lcd_pressed):
+                # Every display key is counted rather than fired: one press
+                # waits for a possible second or third, so nothing runs on
+                # the way to a gesture. See note_gesture.
+                self.note_gesture(name)
+                self.broadcast({"event": "press", "key": name})
+            self.lcd_pressed = lcd_keys
+
+    def note_gesture(self, name, now=None):
+        """Count a possible double or triple press of a display key.
+
+        One press waits `GESTURE_HOLD` before it does anything, so a second
+        or a third can still change what the gesture means:
+
+            1   do what the key is set to (a screen, the cycle, off)
+            2   of a soft key: freeze the screen where it is   (E1)
+            3   L5: a sticky note (E3); L3: the Discord screen (P6)
+
+        A key held down instead of tapped is read in `refresh_gestures`,
+        where the loop can see that it is still down: that is the menu
+        (E2), and it needs no count at all - which is the point of it, a
+        hold being something the hand does rather than something it has to
+        aim at.
+
+        Nothing fires on the way to a gesture *within* the hold: a triple
+        in a hurry runs neither the single press nor the freeze on the way
+        there. The count itself lives longer, for `GESTURE_SPAN`, because a
+        triple tapped at an easy pace has gaps wider than the hold - so a
+        press that arrives late finds the count still standing, and the lone
+        press it follows has already done its job. That is the trade: a
+        gesture you can actually hit, at the price of a stray screen change
+        along the way.
+        """
+        now = time.time() if now is None else now
+        state = self._gestures.get(name)
+        if state is None or now - state[1] > GESTURE_SPAN:
+            state = [0, 0.0, 0.0, None]
+        state[0] += 1
+        state[1] = now
+        if state[0] == 1:
+            state[2], state[3] = now + GESTURE_HOLD, "single"
+        elif state[0] == 2:
+            # Two of a soft key promise the freeze; two of anything else
+            # are still just a press that has not finished arriving.
+            state[2] = now + GESTURE_HOLD
+            state[3] = "freeze" if name in DOUBLE_KEYS else "single"
+        else:
+            action = TRIPLE_KEYS.get(name)
+            if action is None:
+                # No triple on this key: what the double promised still
+                # stands - or has already run - and the count is kept only
+                # so the next press knows the shape of the gesture so far.
+                self._gestures[name] = state
+                return
+            self._gestures[name] = [0, now, 0.0, None]
+            if action == "menu":
+                if self.menu.closed:
+                    self.open_menu()
+                else:
+                    self.close_menu()
+            elif action == "discord":
+                self.show_discord()
+            else:
+                self.toggle_note()
+            return
+        self._gestures[name] = state
+
+    def refresh_gestures(self, now):
+        """A display key whose gesture window has closed does its job.
+
+        Two windows end here, at different times: the action a press
+        promised runs `GESTURE_HOLD` after it, while the count of presses is
+        kept until `GESTURE_SPAN` has passed with no more of them. So the
+        state is not thrown away when the action runs - only the promise is
+        - which is what lets a slower triple still be told apart from three
+        lonely presses.
+
+        A key held down is checked first and answered differently: while it
+        is down the promise it made waits (a tap that turns into a hold must
+        not also change the screen), and at `HOLD_SECONDS` the hold fires
+        and takes the press with it, so a finger that stays where it is
+        cannot open the menu and shut it again.
+        """
+        for name, state in list(self._gestures.items()):
+            if name in HOLD_KEYS and name in self.lcd_pressed:
+                if now - state[1] >= HOLD_SECONDS:
+                    # The hold owns the key now: drop the press, or the
+                    # next tick would find it owing a second menu.
+                    self._gestures.pop(name, None)
+                    if self.menu.closed:
+                        self.open_menu()
+                    else:
+                        self.close_menu()
+                continue
+            if not state[2]:
+                if now - state[1] > GESTURE_SPAN:
+                    # Nothing owed, and the pressing has stopped: forget it.
+                    self._gestures.pop(name, None)
+                continue
+            if now < state[2]:
+                continue
+            pending, state[3], state[2] = state[3], None, 0.0
+            # Nothing underneath the menu to act on: the key would only
+            # change a screen nobody can see.
+            if not self.menu.closed:
+                continue
+            if pending == "freeze":
+                self.toggle_freeze(name)
+            elif pending:
+                self.fire_lcd_key(name)
+
+    def toggle_freeze(self, name=None):
+        """Double press of a soft key: hold the screen where it is (E1).
+
+        The rules get no say until it is asked for again; `g510 autoscreen`
+        reports it and `g510 autoscreen unfreeze` lets go of it.
+        """
+        frozen = self.autoscreen.toggle_freeze()
+        self.last_lcd = 0.0
+        log("autoscreen frozen" if frozen else "autoscreen unfrozen"
+            + (f" ({name} twice)" if name else ""))
+        return frozen
+
+    @property
+    def bindings(self):
+        """Base bindings, overlaid with any profile for the frontmost app."""
+        merged = dict(self.config.get("bindings", {}))
+        profile = (self.config.get("app_profiles") or {}).get(self.current_app)
+        if isinstance(profile, dict):
+            for key, value in profile.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+        return merged
+
+    def active_color(self):
+        """Backlight colour for the frontmost app, brightness applied."""
+        wanted = (self.config.get("app_colors") or {}).get(self.current_app)
+        if not wanted:
+            return self.base_color
+        try:
+            return config.apply_brightness(
+                config.parse_color(wanted), self.config.get("brightness", 100))
+        except config.ColorError:
+            return self.base_color
+
+    def mutate(self, apply):
+        """Re-read the config, apply a change, write it back.
+
+        The CLI and GUI write this file too. Saving our own long-held copy
+        would silently revert whatever they changed since we last read it.
+        """
+        with self.config_lock:
+            fresh = config.load()
+            apply(fresh)
+            if not config.save(fresh):
+                log(f"config not saved: {config.last_error}")
+            self.config = fresh
+            return fresh
+
+    def select_bank(self, name):
+        """Switch the active binding bank and light its M-key."""
+        self.mutate(lambda settings: config.set_bank(settings, name))
+        self.show_bank_led()
+        log(f"bank -> M{name}")
+        return str(name)
+
+    def show_bank_led(self):
+        active = str(self.config.get("active_bank", "1"))
+        with self.lock:
+            if self.keyboard is not None:
+                self.keyboard.set_mkeys([f"m{active}"])
+
+    def advance_screen(self, step=1):
+        """Move to the next screen in the configured cycle."""
+        lcd = self.config.setdefault("lcd", {})
+        cycle = [name for name in lcd.get("cycle") or [] if name in screens.SCREENS]
+        if not cycle:
+            cycle = list(screens.SCREENS)
+        if not lcd.get("enabled", True):
+            lcd["enabled"] = True
+            current = cycle[0]
+        else:
+            try:
+                index = cycle.index(lcd.get("screen", cycle[0]))
+            except ValueError:
+                index = -1
+            current = cycle[(index + step) % len(cycle)]
+        def apply(settings):
+            target = settings.setdefault("lcd", {})
+            target["screen"], target["enabled"] = current, True
+
+        self.mutate(apply)
+        self.last_lcd = 0.0
+        log(f"LCD -> {current}")
+        return current
+
+    def fire_mode_key(self, name):
+        """M1/M2/M3 pick a bank, MR drives recording, GAME is the switch."""
+        try:
+            self._run_mode_key(name)
+        except OSError:
+            raise
+        except Exception as exc:
+            log(f"{name} failed: {type(exc).__name__}: {exc}")
+
+    def _run_mode_key(self, name):
+        if name in ("M1", "M2", "M3"):
+            if self.record_state:
+                return
+            self.select_bank(name[1])
+        elif name == "MR":
+            self.toggle_recording()
+        elif name == "GAME":
+            self.fire_game_switch(True)
+
+    def fire_game_switch(self, engaged):
+        """Run whatever the joystick switch is configured to do."""
+        log(f"game switch {'on' if engaged else 'off'}")
+        try:
+            self._run_game_switch(engaged)
+        except OSError:
+            raise
+        except Exception as exc:
+            log(f"  game switch failed: {type(exc).__name__}: {exc}")
+
+    def _run_game_switch(self, engaged):
+        action = (self.config.get("game_switch") or {}).get(
+            "on" if engaged else "off")
+        if not action:
+            return
+        if isinstance(action, dict):
+            actions.dispatch(action, self.config.get("macros"),
+                             hooks=self.hooks)
+            return
+        if not isinstance(action, str):
+            log(f"  {action!r} is not a valid action")
+            return
+        if action.startswith("bank:"):
+            self.select_bank(action.split(":", 1)[1])
+        elif action.startswith("screen:"):
+            wanted = action.split(":", 1)[1]
+            if wanted in screens.SCREENS:
+                self.mutate(lambda s: s.setdefault("lcd", {}).update(
+                    screen=wanted, enabled=True))
+                self.last_lcd = 0.0
+        elif action.startswith("color:"):
+            try:
+                rgb = config.apply_brightness(
+                    config.parse_color(action.split(":", 1)[1]),
+                    self.config.get("brightness", 100))
+                with self.lock:
+                    self.keyboard.set_backlight(rgb)
+            except config.ColorError:
+                pass
+
+    def toggle_recording(self):
+        """MR: arm, then record onto the next G-key, then finish."""
+        if self.record_state is None:
+            if not actions.can_post_events():
+                log("MR pressed but Accessibility is not granted")
+                return
+            with self.record_lock:
+                self.record_state = "await_key"
+                self.record_target = None
+            self.last_lcd = 0.0
+            log("MR -> waiting for a G-key")
+        elif self.record_state == "await_key":
+            with self.record_lock:
+                self.record_state = None
+            self.last_lcd = 0.0
+            log("MR -> recording cancelled")
+        else:
+            self.finish_recording()
+
+    def start_recording(self, key):
+        active = recorder.Recorder()
+        with self.record_lock:
+            self.record_target = key
+            self.record_state = "recording"
+            self.recorder = active
+        self.last_lcd = 0.0
+        log(f"recording macro onto {key}")
+        thread = threading.Thread(target=self._record_thread, args=(active,),
+                                  daemon=True)
+        thread.start()
+
+    def _record_thread(self, active):
+        """Run the event tap. `active` is passed in rather than read off self,
+        which the main loop may have cleared by the time this runs."""
+        try:
+            active.run(timeout=300.0)
+        except recorder.RecordingError as exc:
+            log(f"recording failed: {exc}")
+        except Exception as exc:
+            log(f"recording failed: {type(exc).__name__}: {exc}")
+        finally:
+            self.finish_recording()
+
+    def finish_recording(self):
+        """Save whatever was captured. Safe to call from either thread, and
+        from both: the second call finds nothing to do."""
+        with self.record_lock:
+            if self.record_state != "recording":
+                return
+            active, self.recorder = self.recorder, None
+            key, self.record_target = self.record_target, None
+            self.record_state = None
+        steps = list(active.steps) if active else []
+        if active:
+            active.stop()
+        self.last_lcd = 0.0
+        if not steps or not key:
+            log("recording discarded (nothing captured)")
+            return
+        name = f"{key.lower()}-m{self.config.get('active_bank', '1')}"
+
+        def apply(settings):
+            settings.setdefault("macros", {})[name] = steps
+            settings.setdefault("bindings", {})[key] = {
+                "type": "macro", "name": name}
+
+        self.mutate(apply)
+        log(f"{key} -> macro {name!r} ({len(steps)} steps)")
+
+    def fire_lcd_key(self, name):
+        """Run whatever the display key is configured to do."""
+        try:
+            self._run_lcd_key(name)
+        except OSError:
+            raise                 # device trouble belongs to the main loop
+        except Exception as exc:
+            log(f"{name} failed: {type(exc).__name__}: {exc}")
+
+    def _run_lcd_key(self, name):
+        action = (self.config.get("lcd_keys") or {}).get(name)
+        if not action:
+            return
+        if isinstance(action, dict):
+            actions.dispatch(action, self.config.get("macros"),
+                             hooks=self.hooks)
+            return
+        if not isinstance(action, str):
+            log(f"{name}: {action!r} is not a valid action")
+            return
+        if action == "next":
+            self.advance_screen(1)
+        elif action == "prev":
+            self.advance_screen(-1)
+        elif action == "off":
+            self.mutate(lambda s: s.setdefault("lcd", {}).update(enabled=False))
+            with self.lock:
+                self.keyboard.clear_lcd()
+            log(f"{name} -> LCD off")
+        elif action.startswith("screen:"):
+            wanted = action.split(":", 1)[1]
+            if wanted in screens.SCREENS:
+                self.mutate(lambda s: s.setdefault("lcd", {}).update(
+                    screen=wanted, enabled=True))
+                self.last_lcd = 0.0
+                log(f"{name} -> LCD {wanted}")
+
+    def fire(self, name):
+        """Run a G-key's binding.
+
+        The config is meant to be hand-edited, so a binding can be any shape
+        at all - a bare string, a dict missing its field, a macro that is a
+        list of strings. None of those may kill the agent, so everything from
+        describing the binding onwards is guarded.
+        """
+        self.state["last_gkey"] = name
+        try:
+            binding = self.bindings.get(name)
+            self.state["last_action"] = actions.describe(binding)
+            if not binding:
+                log(f"{name} pressed (unbound)")
+                return
+            log(f"{name} -> {actions.describe(binding)}")
+            actions.dispatch(binding, self.config.get("macros"),
+                             hooks=self.hooks)
+        except Exception as exc:
+            log(f"  {name} failed: {type(exc).__name__}: {exc}")
+
+    def _policy(self):
+        """The config as autoscreen reads it, with the user's triggers in it.
+
+        A trigger with no `seconds` is a rule that holds a screen while its
+        conditions hold - so it is handed to autoscreen rather than judged a
+        second time: one engine, one hold, one hands-off window, one fallback.
+        It goes in first, so a cause the user wrote by hand is not shadowed
+        by a broad rule sitting above it.
+
+        Only the `autoscreen` block is rebuilt; the rest of the config is
+        handed over as it is, and nothing is written anywhere.
+        """
+        held = triggers.state_rules(self.config)
+        if not held:
+            return self.config
+        settings = dict(self.config)
+        block = dict(self.config.get("autoscreen") or {})
+        block["rules"] = list(held) + list(block.get("rules") or [])
+        settings["autoscreen"] = block
+        return settings
+
+    def refresh_autoscreen(self, now):
+        """Let the rules pick the screen, if one of them has an opinion.
+
+        The answer is written straight into `lcd.screen`, like any other
+        switch - which is also what makes a switch by somebody else visible:
+        the screen no longer being the one autoscreen put up is how it knows
+        a hand, a soft key or the CLI got there first.
+        """
+        current = (self.config.get("lcd") or {}).get("screen", "status")
+        wanted = self.autoscreen.update(now, self._policy(), current)
+        if not wanted:
+            return
+        if wanted == "off":
+            self.mutate(lambda s: s.setdefault("lcd", {}).update(enabled=False))
+            self.autoscreen.rest()
+            with self.lock:
+                self.keyboard.clear_lcd()
+            log("autoscreen -> off")
+            return
+        self.mutate(lambda s: s.setdefault("lcd", {}).update(screen=wanted,
+                                                             enabled=True))
+        self.last_lcd = 0.0
+        log(f"autoscreen -> {wanted} ({self.autoscreen.rule})")
+
+    def refresh_alerts(self, now):
+        """Turn what just happened into something the display can show."""
+        block = self.config.get("timers") or {}
+        for item in self.timers.due(now):
+            self.alerts.push("timeralert", self._timer_data("done", item),
+                             float(block.get("show_seconds", 10) or 0),
+                             block.get("sound"))
+            log(f"timer {timers.left(item.get('seconds') or 0)} is up"
+                + (f" ({item.get('label')})" if item.get("label") else ""))
+        if self.watcher is None:
+            return
+        note = self.config.get("notifications") or {}
+        if not note.get("enabled", True):
+            return
+        for event in self.watcher.drain():
+            data = self._message_data(event)
+            # A source may say how long it wants the panel for. The store's
+            # banners do: they are a system-wide announcement rather than a
+            # line in a conversation, and they arrive seconds late already,
+            # so they are given their own number rather than borrowing the
+            # chat reader's.
+            seconds = event.get("seconds")
+            if seconds is None:
+                seconds = note.get("show_seconds", 10)
+            self.alerts.push("message", data, float(seconds or 0),
+                             note.get("sound"))
+            log(f"{data['app']}: "
+                + (f"{data['author']}: {data['text']}" if data["author"]
+                   else data["text"]))
+
+    def show_trigger(self, event):
+        """Put a trigger's screen up for as long as it asked for.
+
+        An alert borrows the display rather than switching it, so what was
+        underneath goes on being chosen and is what comes back - which is
+        also how a hand-picked screen survives being interrupted.
+        """
+        self.alerts.push(event["screen"], event.get("data") or {},
+                         event["seconds"], event.get("sound") or None)
+        log(f"trigger {event['name']} -> {event['screen']} "
+            f"for {event['seconds']:g}s")
+
+    def refresh_triggers(self, now):
+        """Anything whose condition has just come true, shown now."""
+        for event in self.triggers.update(now, self.config):
+            self.show_trigger(event)
+
+    def trigger_command(self, payload):
+        """What `g510 trigger ...` asks the agent to do."""
+        action = str(payload.get("action") or "list")
+        block = self.config.get("triggers") or {}
+        if action == "list":
+            return {"ok": True,
+                    "enabled": bool(block.get("enabled", True)),
+                    "rules": [rule for rule in (block.get("rules") or [])
+                              if isinstance(rule, dict)]}
+        if action == "fire":
+            name = str(payload.get("name") or "")
+            try:
+                event = self.triggers.fire(self.config, name)
+            except KeyError:
+                return {"ok": False,
+                        "error": f"no trigger called {name!r} - "
+                                 "see: g510 trigger list"}
+            self.show_trigger(event)
+            return {"ok": True, "fired": event["name"],
+                    "screen": event["screen"], "seconds": event["seconds"]}
+        return {"ok": False, "error": f"unknown trigger action {action!r}"}
+
+    # -- the menu on the panel -------------------------------------------
+
+    def ensure_tap(self):
+        """The event tap the menu navigates with, started the first time."""
+        if self.keytap is not None and self.keytap.tap is not None:
+            return True
+        if self.keytap is None:
+            self.keytap = keytap.KeyTap(decide=self.wants_menu_key, log=log)
+        if not self.keytap.start():
+            log(f"menu cannot take keys: {self.keytap.error}")
+            return False
+        return True
+
+    def wants_menu_key(self, name, character):
+        """Whether a key belongs to the panel right now.
+
+        Called on the tap's own thread, so this reads flags and nothing
+        else. The menu is modal while it is open: the navigation keys are
+        always its, and a printable character only while a text field is
+        being typed into - a letter pressed at a list still goes to the app
+        underneath. Writing a note is modal the other way round: the note
+        takes everything until enter or esc, because there is no list to be
+        sitting at.
+        """
+        if not self.menu.closed:
+            if name in keytap.NAV_KEYS:
+                return True
+            return bool(character) and self.menu_typing
+        if self.note_draft is not None:
+            return name in ("enter", "esc", "backspace") or bool(character)
+        return False
+
+    def open_menu(self):
+        with self.menu_lock:
+            if not self.menu.closed:
+                return True
+            if not self.ensure_tap():
+                return False
+            self.menu.open()
+            self.menu_touch = time.time()
+            self.menu_typing = False
+            self.last_lcd = 0.0
+            log("menu open")
+            return True
+
+    def close_menu(self):
+        with self.menu_lock:
+            if self.menu.closed:
+                return
+            self.menu.close()
+            self.menu_typing = False
+            self.last_lcd = 0.0
+            log("menu closed")
+
+    def press_menu(self, name):
+        """One key for the menu, and everything that changes about the frame."""
+        with self.menu_lock:
+            was_open = not self.menu.closed
+            self.menu.press(name)
+            self.menu_touch = time.time()
+            view = self.menu.view()
+            editing = view.get("editing") or {}
+            self.menu_typing = bool(editing) and editing.get("kind") == "text"
+            if was_open and self.menu.closed:
+                log("menu closed")
+            # The menu answers a line at a time and should answer as fast
+            # as a key does, whatever `lcd.refresh_seconds` is set to.
+            self.last_lcd = 0.0
+
+    def refresh_menu(self, now):
+        """Keys the tap took: the menu's while it is open, the note's while
+        one is being written, and nobody's otherwise."""
+        with self.menu_lock:
+            if self.keytap is not None:
+                keys = self.keytap.drain()
+                if not self.menu.closed:
+                    for name, _character in keys:
+                        self.press_menu(name)
+                        if self.menu.closed:
+                            break
+                elif self.note_draft is not None:
+                    for name, character in keys:
+                        self.feed_note(name, character)
+            if not self.menu.closed and now - self.menu_touch >= MENU_IDLE:
+                self.close_menu()
+            if self.note_draft is not None and now - self.note_touch >= NOTE_IDLE:
+                self.note_draft = None
+                self.last_lcd = 0.0
+                log("note entry timed out")
+
+    # -- the sticky note (E3) ---------------------------------------------
+
+    @property
+    def note_active(self):
+        """A note is up: either pinned, or waiting to be finished."""
+        return self.note is not None or self.note_draft is not None
+
+    def toggle_note(self):
+        """Three presses of L5: write a note, or take down the one that is.
+
+        Taking it down is what hands the display back to the four screens
+        the soft keys pick, so nothing else has to be undone with it.
+        """
+        with self.menu_lock:
+            if self.note_active:
+                self.note = None
+                self.note_draft = None
+                log("note cleared")
+            else:
+                if not self.ensure_tap():
+                    log("note cannot take keys: "
+                        + (self.keytap.error if self.keytap else "no event tap"))
+                    return False
+                if not self.menu.closed:
+                    self.close_menu()
+                self.note_draft = ""
+                self.note_touch = time.time()
+                log("note: type it, enter pins it, esc cancels")
+            self.last_lcd = 0.0
+        return True
+
+    def show_discord(self):
+        """Three presses of L3: put the Discord screen up.
+
+        It is a screen like any other in that `lcd.screen` names it, so
+        picking it by hand is a pick: autoscreen leaves it alone for
+        `manual_seconds` afterwards, exactly as `g510 lcd discord` would.
+        """
+        def apply(settings):
+            target = settings.setdefault("lcd", {})
+            target["screen"], target["enabled"] = "discord", True
+
+        self.mutate(apply)
+        self.last_lcd = 0.0
+        log("LCD -> discord")
+        return "discord"
+
+    def vencord_command(self, payload):
+        """What `g510 discord ...` asks of the plugin behind the screen.
+
+        Nothing here can read Discord: the plugin can, and it says what it
+        found over the link. So this side matches a name to an id against
+        the last thing that was pushed, passes the command on, and lets the
+        next push be the proof it ran.
+        """
+        action = str(payload.get("action") or "state")
+        status = self.link.status() if self.link is not None else {
+            "connected": False, "error": "the link is off",
+            "state": {}, "waiting": 0, "port": 0, "seen": None}
+        if action == "state":
+            return {"ok": True, **status}
+        if not status.get("connected"):
+            # The plugin pushes once a second while Discord is running, so
+            # "not seen for a while" is the whole diagnosis.
+            return {"ok": False, "error": "the Vencord plugin has not "
+                    "connected - is Vesktop running with the G510 "
+                    "plugin enabled?", "status": status}
+        if action == "open":
+            wanted = str(payload.get("name") or "").strip()
+            if wanted.lower() in ("@me", "friends", "dms"):
+                # The list of DMs rather than a channel - what the panel
+                # shows as "nothing open" - and a route, not an id.
+                number = self.link.send({"cmd": "open", "id": "@me"})
+                return {"ok": True, "n": number,
+                        "channel": {"id": "@me", "name": "friends"},
+                        "status": status}
+            channels = (status.get("state") or {}).get("channels") or []
+            found = _find_channel(channels, wanted)
+            if isinstance(found, str):
+                return {"ok": False, "error": found, "status": status}
+            number = self.link.send({"cmd": "open", "id": found["id"]})
+            return {"ok": True, "n": number, "channel": found,
+                    "status": status}
+        if action == "older":
+            number = self.link.send(
+                {"cmd": "older", "limit": int(payload.get("limit") or 30)})
+            return {"ok": True, "n": number, "status": status}
+        if action == "say":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                return {"ok": False, "error": "no text given"}
+            number = self.link.send({"cmd": "say", "text": text})
+            return {"ok": True, "n": number, "status": status}
+        if action == "reply":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                return {"ok": False, "error": "no text given"}
+            messages = (status.get("state") or {}).get("messages") or []
+            # The word off the command line - `last`, or the reference
+            # `history` printed - is resolved here, because this is the
+            # side that holds the messages. The plugin is only ever given
+            # an id it can put in a reply reference.
+            target, problem = link.resolve(messages, payload.get("id"))
+            if problem:
+                return {"ok": False, "error": problem, "status": status}
+            number = self.link.send({"cmd": "reply", "id": target,
+                                     "text": text})
+            return {"ok": True, "n": number, "status": status}
+        return {"ok": False, "error": f"unknown action {action!r}. "
+                "Try: state open older say reply"}
+
+    def feed_note(self, name, character):
+        """One key while a note is being written. `enter` pins it."""
+        self.note_touch = time.time()
+        if name == "enter":
+            text = (self.note_draft or "").strip()
+            self.note_draft = None
+            self.note = text[:NOTE_MAX] or None
+            if self.note:
+                log(f"note pinned: {self.note}")
+            self.last_lcd = 0.0
+            return
+        if name == "esc":
+            self.note_draft = None
+            self.last_lcd = 0.0
+            log("note cancelled")
+            return
+        if name == "backspace":
+            self.note_draft = (self.note_draft or "")[:-1]
+        elif character and len(self.note_draft or "") < NOTE_MAX:
+            self.note_draft = (self.note_draft or "") + character
+        self.last_lcd = 0.0
+
+    def note_command(self, payload):
+        """What `g510 note ...` asks the agent to do.
+
+        The same note the triple press writes, for when the text is easier
+        to type at a shell than on the panel.
+        """
+        action = str(payload.get("action") or "show")
+        with self.menu_lock:
+            if action in ("set", "pin"):
+                text = str(payload.get("text") or "").strip()
+                if not text:
+                    return {"ok": False, "error": "no text given"}
+                self.note_draft = None
+                self.note = text[:NOTE_MAX]
+                self.last_lcd = 0.0
+                log(f"note pinned: {self.note}")
+            elif action in ("clear", "off"):
+                self.note = None
+                self.note_draft = None
+                self.last_lcd = 0.0
+                log("note cleared")
+            return {"ok": True, "note": self.note,
+                    "typing": self.note_draft is not None}
+
+    def autoscreen_command(self, payload):
+        """Freeze and thaw on request: `g510 autoscreen freeze|unfreeze`.
+
+        The freeze lives in the agent, so this is the only place that can
+        answer for it - the config file says nothing about it.
+        """
+        action = str(payload.get("action") or "status")
+        if action == "freeze":
+            self.autoscreen.freeze(True)
+            self.last_lcd = 0.0
+            log("autoscreen frozen")
+        elif action == "unfreeze":
+            self.autoscreen.freeze(False)
+            self.last_lcd = 0.0
+            log("autoscreen unfrozen")
+        elif action == "toggle":
+            self.toggle_freeze()
+        return {"ok": True, "frozen": bool(self.autoscreen.frozen),
+                "enabled": bool((self.config.get("autoscreen") or {})
+                                .get("enabled", True))}
+
+    def save_config_change(self, apply):
+        """Write one change and re-apply what it drives.
+
+        Re-reading keeps whatever the CLI or the GUI wrote while the menu
+        was open, and re-applying is what `reload_config` already does for
+        them: the font, the backlight and the chat reader all read the
+        config object rather than the file, so a change is not real until
+        they have seen it.
+        """
+        with self.config_lock:
+            fresh = config.load()
+            apply(fresh)
+            if not config.save(fresh):
+                log(f"config not saved: {config.last_error}")
+        self.reload_config()
+        self.last_lcd = 0.0
+
+    def menu_action(self, name, arg=None):
+        """Everything the menu can ask for that is not a config value."""
+        try:
+            return self._menu_action(name, arg)
+        except (OSError, ValueError, KeyError, TypeError,
+                config.ColorError) as exc:
+            log(f"menu {name} failed: {type(exc).__name__}: {exc}")
+            return f"{name} failed: {exc}"
+
+    def _menu_action(self, name, arg=None):
+        if name == "leave":
+            # Nothing to do here: the menu closes itself the moment this
+            # returns (`Menu._select` calls `close()` right after), and
+            # `press_menu` notices and logs it. Closing again from inside
+            # the call would have the panel shut the same menu twice on one
+            # press of Leave - and the second log reads as a second gesture.
+            # The ways *out* that the panel owns - esc, the hold, the idle
+            # timeout - all go through `close_menu()` themselves.
+            return None
+        if name == "next":
+            return f"screen -> {self.advance_screen(1)}"
+        if name == "bank":
+            return f"bank {self.select_bank(arg)}"
+        if name == "reload":
+            self.reload_config()
+            self.last_lcd = 0.0
+            return "config reloaded"
+        if name == "timer_start":
+            reply = self.timer_command({"action": "start", "value": arg})
+            if not reply.get("ok"):
+                return str(reply.get("error") or "timer did not start")
+            item = reply.get("timer") or {}
+            return (f"{item.get('label') or arg}: "
+                    f"{timers.left(item.get('seconds') or 0)}")
+        if name == "timer_cancel":
+            reply = self.timer_command({"action": "cancel", "value": "all"})
+            gone = reply.get("cancelled") or []
+            if not gone:
+                return str(reply.get("error") or "no timer is running")
+            return "cancelled " + ", ".join(
+                str(item.get("label") or item.get("name") or "timer")
+                for item in gone)
+        if name == "trigger_fire":
+            reply = self.trigger_command({"action": "fire", "name": arg})
+            if not reply.get("ok"):
+                return str(reply.get("error") or "did not fire")
+            return f"fired {reply['fired']} -> {reply['screen']}"
+        if name == "poweron":
+            rgb = config.parse_color(str(arg))
+            with self.lock:
+                if self.keyboard is None:
+                    return "keyboard not connected"
+                self.keyboard.set_power_on_backlight(rgb)
+            return f"power-on -> {arg}"
+        if name == "mkeys":
+            with self.lock:
+                if self.keyboard is None:
+                    return "keyboard not connected"
+                self.keyboard.set_mkeys([] if arg == "off" else [str(arg)])
+            return f"M-keys -> {arg}"
+        if name == "when_add":
+            dotted = str(arg)
+            self.save_config_change(
+                lambda fresh: menu.add_when(fresh, dotted))
+            return f"{dotted.rsplit(menu.SEP, 1)[-1]}: added"
+        if name == "when_del":
+            dotted = str(arg)
+            self.save_config_change(
+                lambda fresh: menu.del_when(fresh, dotted))
+            return "condition removed"
+        if name == "field_add":
+            path = str(arg)
+            self.save_config_change(lambda fresh: menu.add_field(fresh, path))
+            return f"{path.rsplit(menu.SEP, 1)[-1]}: set"
+        if name == "field_del":
+            path = str(arg)
+            self.save_config_change(lambda fresh: menu.del_field(fresh, path))
+            return f"{path.rsplit(menu.SEP, 1)[-1]}: cleared"
+        if name == "rule_add":
+            path = str(arg)
+            self.save_config_change(lambda fresh: menu.add_rule(fresh, path))
+            return "rule added"
+        if name == "rule_del":
+            path = str(arg)
+            self.save_config_change(lambda fresh: menu.drop(fresh, path))
+            return "rule deleted"
+        if name == "gauge_clear":
+            self.save_config_change(
+                lambda fresh: fresh.update({"gauges": []}))
+            return "gauges cleared"
+        if name == "gauge_add":
+            return self._add_gauge(str(arg or ""))
+        if name == "app_color_add":
+            return self._add_app_colour(str(arg or ""))
+        return f"unknown menu action {name!r}"
+
+    def _add_gauge(self, raw):
+        """A gauge from "label|command" - a command that prints a number."""
+        label, sep, command = raw.partition("|")
+        label, command = label.strip(), command.strip()
+        if not sep or not label or not command:
+            return "use: label|command"
+        if len(self.config.get("gauges") or []) >= 3:
+            return "three gauges is all the panel has room for"
+        def apply(fresh):
+            fresh.setdefault("gauges", []).append(
+                {"label": label, "command": command})
+        self.save_config_change(apply)
+        return f"gauges: {label}"
+
+    def _add_app_colour(self, raw):
+        """A colour for one app from "app|colour"."""
+        app, sep, colour = raw.partition("|")
+        app, colour = app.strip(), colour.strip()
+        if not sep or not app or not colour:
+            return "use: app|colour"
+        config.parse_color(colour)          # raises ColorError if it is not
+        def apply(fresh):
+            fresh.setdefault("app_colors", {})[app] = colour
+        self.save_config_change(apply)
+        return f"{app} -> {colour}"
+
+    def menu_command(self, payload):
+        """What `g510 menu ...` asks the agent to do."""
+        action = str(payload.get("action") or "show")
+        if action == "open":
+            if not self.open_menu():
+                return {"ok": False,
+                        "error": (self.keytap.error
+                                  if self.keytap else "no event tap")}
+        elif action == "close":
+            self.close_menu()
+        elif action == "key":
+            name = str(payload.get("name") or "")
+            if not name:
+                return {"ok": False, "error": "no key given"}
+            if self.menu.closed:
+                if name == "esc":
+                    # Esc walks out of things; it does not open one.
+                    return {"ok": True, "open": False}
+                if not self.open_menu():
+                    return {"ok": False,
+                            "error": (self.keytap.error
+                                      if self.keytap else "no event tap")}
+            self.press_menu(name)
+        reply = {"ok": True, "open": not self.menu.closed}
+        if not self.menu.closed:
+            reply["view"] = self.menu.view()
+        return reply
+
+    def refresh_lcd(self, now):
+        lcd_config = self.config.get("lcd", {})
+        menu_open = not self.menu.closed
+        note = self.note_active
+        if not lcd_config.get("enabled", True) and not (menu_open or note):
+            # Blank: nothing to keep in step, so autoscreen forgets what it
+            # last put up and takes the config as it finds it when the
+            # display comes back. The menu is exempt - it is how the display
+            # gets turned back on - and so is a note, because the key press
+            # that put it there has to be visible while it is answered.
+            self.autoscreen.rest()
+            return
+        if self.record_state or menu_open or note:
+            # MR while it records, the menu while it is open and a note
+            # while it is up own the display, so autoscreen stands down
+            # rather than switching under them. Between them they cover
+            # every moment, so the screen underneath is never touched and
+            # simply comes back.
+            self.autoscreen.rest()
+        else:
+            self.refresh_autoscreen(now)
+            # autoscreen saves the config, which rebuilds it: this dict may
+            # be one the reload just threw away, so ask again.
+            lcd_config = self.config.get("lcd", {})
+        # An interruption borrows the display without touching `lcd.screen`,
+        # so the screen underneath goes on being chosen the whole time and
+        # is simply what comes back when the interruption is over. An alert
+        # is time-boxed and outranks a note: it rings, then the note is
+        # still there.
+        alert = None if (self.record_state or menu_open) else \
+            self.alerts.current(now)
+        if bool(alert) != self.alerting:
+            self.alerting = bool(alert)
+            self.last_lcd = 0.0          # one starts or ends: draw it now
+        if now - self.last_lcd < float(lcd_config.get("refresh_seconds", 1.0)):
+            return
+        self.last_lcd = now
+        # What the plugin last said, in reach of every screen below: the
+        # Discord screen draws it, and any other screen ignores it.
+        self.state["discord"] = self.link.state() if self.link else {}
+        if menu_open:
+            with self.menu_lock:
+                self.state["menu"] = self.menu.view()
+            try:
+                pixels = screens.render("menu", self.state)
+            finally:
+                self.state.pop("menu", None)
+        elif self.record_state:
+            self.state["record_state"] = self.record_state
+            self.state["record_target"] = self.record_target
+            active = self.recorder
+            self.state["record_steps"] = len(active.steps) if active else 0
+            pixels = screens.render("record", self.state)
+        else:
+            self.state.pop("record_state", None)
+            if alert:
+                self.state["alert"] = alert["data"]
+                try:
+                    pixels = screens.render(alert["screen"], self.state)
+                finally:
+                    self.state.pop("alert", None)
+            elif note:
+                # The note is what is on the panel until the same triple
+                # press takes it down; the screen underneath is untouched.
+                entry = self.note_draft is not None
+                self.state["note"] = self.note_draft if entry else self.note
+                self.state["note_entry"] = entry
+                try:
+                    pixels = screens.render("note", self.state)
+                finally:
+                    self.state.pop("note", None)
+                    self.state.pop("note_entry", None)
+            else:
+                pixels = screens.render(lcd_config.get("screen", "status"),
+                                        self.state)
+        with self.lock:
+            self.keyboard.send_lcd(pixels)
+
+    INDICATORS = ("off", "printing", "claude", "recording")
+
+    def indicator_state(self, what):
+        """Whether a given indicator should be lit right now."""
+        if what == "printing":
+            import printer
+            return printer.is_printing(printer.status())
+        if what == "claude":
+            reading = screens.claude_utilization()
+            value = reading.get("five_hour")
+            return value is not None and value >= 80
+        if what == "recording":
+            return self.record_state is not None
+        return False
+
+    def refresh_indicators(self, now):
+        """Drive the two lock LEDs macOS leaves dark.
+
+        Only written when the answer changes, so this is not touching the
+        keyboard interface every second.
+        """
+        wanted = self.config.get("indicators") or {}
+        if not any(v and v != "off" for v in wanted.values()):
+            return
+        if now - self.last_leds < 2.0:
+            return
+        self.last_leds = now
+        try:
+            if self.leds is None:
+                self.leds = device.LockLeds()
+            self.leds.set(num=self.indicator_state(wanted.get("numlock")),
+                          scroll=self.indicator_state(wanted.get("scrolllock")))
+        except Exception as exc:
+            log(f"could not drive the lock LEDs: {exc}")
+            self.leds = None
+
+    def refresh_app_color(self, now):
+        """Track the frontmost app: both colours and profiles depend on it."""
+        if now - self.last_app_check < APP_CHECK_INTERVAL:
+            return
+        self.last_app_check = now
+        name = screens.frontmost_app()
+        if name == self.current_app:
+            return
+        self.current_app = name
+        with self.lock:
+            self.keyboard.set_backlight(self.active_color())
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        log("g510 daemon starting")
+        self.server.start()
+        self.sync_watcher()
+        self.sync_link()
+        log(f"control socket at {ipc.SOCKET_PATH}")
+        while self.running:
+            if self.keyboard is None:
+                if not self.connect():
+                    time.sleep(RECONNECT_DELAY)
+                    continue
+            try:
+                now = time.time()
+                self.handle_gkeys()
+                self.refresh_gestures(now)
+                self.refresh_menu(now)
+                self.refresh_alerts(now)
+                self.refresh_triggers(now)
+                self.refresh_lcd(now)
+                self.refresh_app_color(now)
+                self.refresh_indicators(now)
+            except (OSError, ValueError) as exc:
+                self.drop(exc)
+                time.sleep(RECONNECT_DELAY)
+                continue
+            time.sleep(POLL_INTERVAL)
+        self.shutdown()
+
+    def shutdown(self):
+        log("g510 daemon stopping")
+        if self.keytap is not None:
+            try:
+                self.keytap.stop()
+            except Exception:
+                pass
+        watcher, self.watcher = self.watcher, None
+        if watcher is not None:
+            try:
+                watcher.stop()          # hands the enhanced-interface switch
+            except Exception:           # back to the chat app
+                pass
+        endpoint, self.link = self.link, None
+        if endpoint is not None:
+            try:
+                endpoint.stop()         # and lets go of the local port
+            except Exception:
+                pass
+        self.server.stop()
+        if self.leds is not None:
+            try:
+                self.leds.close()
+            except Exception:
+                pass
+        with self.lock:
+            keyboard, self.keyboard = self.keyboard, None
+            if keyboard:
+                try:
+                    keyboard.clear_lcd()
+                except Exception:
+                    pass
+                try:
+                    keyboard.close()
+                except Exception:
+                    pass
+
+
+def log(message):
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def main():
+    Daemon().run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
