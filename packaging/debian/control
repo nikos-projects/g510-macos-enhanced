@@ -1,0 +1,36 @@
+Source: g510-linux
+Section: utils
+Priority: optional
+Maintainer: Paul <paulloth2208@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: g510-linux
+Architecture: all
+Depends: ${misc:Depends},
+         ${python3:Depends},
+         python3,
+         python3-evdev,
+         python3-pil
+Recommends: playerctl,
+            wtype,
+            python3-pyside6.qtwidgets,
+            python3-pyside6.qtsvg
+Description: userspace driver for the Logitech G510 keyboard
+ Drives the parts of a Logitech G510 that the kernel leaves alone. The in-tree
+ hid-lg-g15 driver already exposes the RGB backlight, the M-key LEDs and the
+ G-keys as ordinary input and LED devices; this adds the 160x43 LCD, bindings
+ for the eighteen G-keys and the five keys under the display, and macro
+ recording and replay.
+ .
+ The agent runs as a systemd user unit rather than as root, because it types
+ into the session and launches the user's applications. It reaches the
+ keyboard through hidraw and the LED class, with access granted by the udev
+ rules this package installs.
+ .
+ playerctl is used by the now-playing screen and wtype by bindings that type
+ text on Wayland; both are optional and the features that need them are
+ skipped when they are absent.

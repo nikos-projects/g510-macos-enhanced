@@ -1,0 +1,14 @@
+# Paths are relative to packaging/, which is this source package's root.
+#
+# /lib/udev/rules.d rather than /etc/udev/rules.d: /etc is for the
+# administrator's own rules, and a file shipped there would be treated as a
+# conffile and left behind, modified, on removal.
+udev/99-g510.rules      lib/udev/rules.d
+
+# /usr/lib/systemd/user is where a package's user units belong. It is not
+# enabled here - see postinst for why that is left to the user.
+systemd/g510.service    usr/lib/systemd/user
+
+g510                    usr/bin
+
+g510.desktop            usr/share/applications

@@ -1,0 +1,60 @@
+#!/usr/bin/make -f
+# Build the binary package with:  dpkg-buildpackage -us -uc -b
+#
+# There is nothing to compile and nothing to run setup.py for. The work is
+# copying two sets of Python modules into one directory, in the layout the
+# import model expects, and letting debhelper place the udev rule, the user
+# unit and the entry point.
+
+# The sources live one level up: this debian/ directory sits in packaging/,
+# not at the top of the checkout, so that the macOS build files at the root
+# are left alone.
+TOP := $(CURDIR)/..
+SHARE := debian/g510-linux/usr/share/g510-linux
+
+# The shared, platform-independent half of the program. Everything else at the
+# repo root is either macOS-only or is replaced by a file in linux/, and
+# shipping it would mean the wrong one wins on sys.path.
+#
+#   config ipc refresh      plain data and helpers, no platform in them
+#   daemon                  the agent; the hardware under it swaps
+#   control printer         reached from the command line and the screens
+#   cli                     the command line itself
+#
+# Deliberately absent, having followed the imports rather than the file list:
+#
+#   device lcd actions      linux/ has its own
+#   recorder screens
+#   layout                  macOS-only: it asks Carbon which character each
+#                           positional keycode produces. Only the macOS
+#                           actions.py imports it; linux/actions.py does not.
+#   main                    the py2app bundle's one-executable dispatcher.
+#                           Nothing imports it, and its no-argument path opens
+#                           the menu bar app. /usr/bin/g510 calls cli directly.
+#   gui window widgets      macOS user interface
+#   pane_*
+#   setup.py make-dmg.sh    the macOS build
+MODULES := cli.py config.py control.py daemon.py ipc.py printer.py refresh.py
+
+%:
+	dh $@ --with python3
+
+# No build system to autodetect; saying so is quicker than letting debhelper
+# look for one and is one less thing to be surprised by.
+override_dh_auto_build:
+	@:
+
+override_dh_auto_test:
+	@:
+
+override_dh_auto_install:
+	install -d $(SHARE)
+	install -m 644 $(addprefix $(TOP)/,$(MODULES)) $(SHARE)
+	install -d $(SHARE)/linux
+# Top-level *.py only, so linux/tests and __pycache__ stay out of the package.
+	install -m 644 $(TOP)/linux/*.py $(SHARE)/linux
+
+# The README explains the permissions and the Wayland limitation, so it is
+# worth having on the installed system and not only in the checkout.
+override_dh_installdocs:
+	dh_installdocs $(TOP)/linux/README.md
