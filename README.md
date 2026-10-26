@@ -15,14 +15,16 @@ with three additions:
   macOS keeps, with no permission to ask for.
 
 Everything else, including how the keyboard itself is driven, is unchanged.
-There is no Linux port here: the upstream `linux/` tree and the Debian
-packaging are not part of this fork.
+There is no Linux port here (yet): the upstream `linux/` tree and the Debian
+packaging are not part of this fork (yet).
 
 Logitech never shipped a driver for this keyboard that runs on Apple Silicon:
 the last Mac build of Logitech Gaming Software is 8.53.130 (June 2014, Intel
 only, OS X 10.8/10.9, kernel extension), the G510 was not on its Mac device
 list, and G HUB dropped the keyboard entirely. Logitech's G510 support page now
 offers no downloads at all.
+
+This fork was ironically tested on a Hackintosh - macOS Sequoia 15.8.1
 
 This talks to the keyboard's vendor HID interface (usage page 0xff00) from
 userspace instead. No kernel extension, nothing to whitelist. Report layouts
