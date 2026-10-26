@@ -1,4 +1,4 @@
-# g510 (autoscreen fork)
+# g510 (enhanced fork)
 
 Control a Logitech G510 gaming keyboard on macOS.
 
