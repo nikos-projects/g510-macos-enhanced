@@ -726,10 +726,13 @@ Three panes, and the keys move between them:
                each server in sidebar order, without Discord's own view
                moving. Enter opens the channel under the cursor.
     messages   one message at a time, newest first. Up and down move
-               through them, asking the plugin for the page behind the
-               oldest when there is more history. Enter answers the
-               message on show; right writes a new one instead; left goes
-               back to the channels.
+               through them, and the page behind the oldest is asked for
+               as the cursor nears it rather than once it has run out -
+               a page that starts at thirty lines and doubles each time,
+               up to the hundred Discord answers for in one request, so
+               the further back you climb the fewer keys it costs.
+               Enter answers the message on show; right writes a new one
+               instead; left goes back to the channels.
     compose    the message itself. Enter sends, esc throws the draft
                away. Typing an @ starts a mention: the plugin offers the
                people, the roles, @everyone and @here that fit the word,
@@ -832,9 +835,11 @@ been since the last push.
 - **Only the channel the client is on is followed live.** Messages in
   other channels are what the list's `*` and `@` marks are for; `open` -
   or the arrow keys, once the screen has them - is how you get to them.
-- **History is fetched, not watched.** `older`, or up-arrow at the oldest
-  message, asks Discord for a page behind what is held; nothing behind
-  that is read until it is asked for.
+- **History is fetched, not watched.** `older`, or up-arrow near the
+  oldest message, asks Discord for a page behind what is held; nothing
+  behind that is read until it is asked for. The page grows the further
+  back you climb - thirty lines, then sixty, then as many as Discord
+  will answer for at once - and starts over in each channel.
 - **No reactions, edits, attachments or typing state** - the last line is
   the message's text and who said it, at panel width. Sending is plain
   text: a mention is the only markup that goes in.

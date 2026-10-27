@@ -46,6 +46,11 @@ IDLE_COMPOSE = 60.0      # writing nobody goes on with gives the keys back
 ERROR_SECONDS = 5.0      # how long a refusal stays on the panel
 WAIT_SECONDS = 2.0       # how long a command is believed to be in flight
 PAGE = 30                # messages one page of history asks the plugin for
+PAGE_MAX = 100           # the most Discord will answer for in one request,
+                         # which is what a page grows towards
+PREFETCH = 2             # messages from the oldest held where the page
+                         # behind them is already asked for, so climbing
+                         # never stops dead at a page edge
 OLDER_GAP = 1.0          # one page of history in flight at a time, however
                          # quickly the arrow key is tapped
 SCROLL_LEAD = 2.5        # seconds a freshly highlighted message is held still,
@@ -134,6 +139,8 @@ class Browser:
         self.error = None
         self.error_until = 0.0
         self.older_at = 0.0
+        self.older_for = None         # whose history `older_n` counts pages of
+        self.older_n = 0              # pages asked for there: the page grows
         self.touch = 0.0              # the last key, for the idle timeout
         self._state = {}
         self._outbox = []
@@ -209,6 +216,15 @@ class Browser:
         """
         now = time.time() if now is None else now
         self._state = state if isinstance(state, dict) else {}
+
+        open_id = str((self._state.get("channel") or {}).get("id") or "")
+        if open_id != self.older_for:
+            # Another conversation: the history behind this one is its own,
+            # so the pages start small again instead of at whatever the last
+            # channel had grown to - and a channel with nothing open behind
+            # it says so rather than inheriting a count from nowhere.
+            self.older_for = open_id
+            self.older_n = 0
 
         listed = str(self._state.get("list") or "")
         if listed and self.pending_list == listed:
@@ -403,6 +419,28 @@ class Browser:
         if name == "esc":
             self.close()
 
+    def _ask_older(self, state, now):
+        """Queue one page of the history behind what is held.
+
+        The page grows while the reader climbs - 30, then 60, then as much
+        as Discord will answer for in one request - because the further
+        back somebody reads, the fewer keystrokes they are prepared to
+        spend on the way there. It grows per channel and starts over in
+        the next one, where there is no depth behind it yet.
+
+        Two things stop this running away: the gap, which keeps one page
+        in flight however fast the arrow is tapped, and `has_more`, which
+        the plugin drops once it can no longer make the buffer any bigger.
+        """
+        if not state.get("has_more"):
+            return
+        if now - self.older_at < OLDER_GAP:
+            return
+        self.older_at = now
+        size = min(PAGE << min(self.older_n, 4), PAGE_MAX)
+        self.older_n += 1
+        self._outbox.append(("older", size))
+
     def _press_messages(self, name, now):
         state = self._state
         messages = state.get("messages") or []
@@ -414,15 +452,20 @@ class Browser:
                 index = len(messages) - 1        # start on the newest
             if name == "up":
                 if index == 0:
-                    # At the top of what is held: ask for the page behind
-                    # it, but only one at a time - a key held down must
-                    # not turn into fifty requests the plugin queues up.
-                    if state.get("has_more") \
-                            and now - self.older_at >= OLDER_GAP:
-                        self.older_at = now
-                        self._outbox.append(("older", PAGE))
+                    # Nothing above to move onto, so this press *is* the
+                    # ask for the page behind what is held - but only one
+                    # of those at a time: a key held down must not turn
+                    # into fifty requests the plugin queues up.
+                    self._ask_older(state, now)
                     return
                 index -= 1
+                if index <= PREFETCH:
+                    # Coming up on the oldest held: ask for the next page
+                    # while there is still somewhere for the cursor to go.
+                    # Waiting until there is nothing left reads as a stall
+                    # at every page edge, which is the whole reason the
+                    # first line of a long scroll used to feel stuck.
+                    self._ask_older(state, now)
             else:
                 if index >= len(messages) - 1:
                     return

@@ -1334,7 +1334,8 @@ class Daemon:
             return
         if kind == "suggest":
             return                      # one log line per keystroke is noise
-        detail = str(payload.get("name") or payload.get("id") or "")
+        detail = str(payload.get("name") or payload.get("id")
+                     or payload.get("limit") or "")
         log(f"discord {kind}" + (f" {detail}" if detail else ""))
         if kind in ("say", "reply"):
             # Whose answer matters: the next ack with this number or past

@@ -462,7 +462,58 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(first, [("older", browse.PAGE)])
         self.assertEqual(again, [])                   # one page at a time
         later = self.browser.press("up", now=102.0)   # past the gap: another
-        self.assertEqual(later, [("older", browse.PAGE)])
+        self.assertEqual(later, [("older", 2 * browse.PAGE)])
+
+    def test_the_page_grows_the_further_back_you_climb(self):
+        self.browser.pane = browse.PANE_MESSAGES
+        self.browser.message_id = "41"
+        self.browser.update(state(has_more=True), 100.0)
+        sizes = []
+        for at in (101.0, 102.0, 103.0, 104.0, 105.0):
+            sizes += [n for _, n in self.browser.press("up", now=at)]
+        self.assertEqual(sizes,
+                         [browse.PAGE, 2 * browse.PAGE,
+                          browse.PAGE_MAX, browse.PAGE_MAX,
+                          browse.PAGE_MAX])           # Discord stops at 100
+
+    def test_another_channel_starts_the_pages_small_again(self):
+        self.browser.pane = browse.PANE_MESSAGES
+        self.browser.message_id = "41"
+        self.browser.update(state(has_more=True), 100.0)
+        for at in (101.0, 102.0, 103.0):
+            self.browser.press("up", now=at)
+        self.assertEqual(self.browser.older_n, 3)
+        self.browser.update(state(channel={"id": "2", "name": "random"},
+                                  has_more=True), 104.0)
+        self.assertEqual(self.browser.older_n, 0)
+        self.assertEqual(self.browser.press("up", now=105.0),
+                         [("older", browse.PAGE)])
+
+    def test_climbing_to_the_oldest_line_asks_before_there_is_nowhere_left(self):
+        rows = [{"id": str(n), "author": "mira", "text": "hi"}
+                for n in range(1, 6)]                 # oldest first
+        self.browser.pane = browse.PANE_MESSAGES
+        self.browser.update(state(messages=rows, has_more=True), 100.0)
+        self.browser.message_id = "4"                 # three from the oldest
+        self.assertEqual(self.browser.press("up", now=101.0),
+                         [("older", browse.PAGE)])    # asked on the way in
+        self.assertEqual(self.browser.message_id, "3") # and still moved
+        self.browser.message_id = "5"                 # the newest, no ask
+        self.assertEqual(self.browser.press("up", now=102.0), [])
+        self.assertEqual(self.browser.message_id, "4")
+        self.browser.message_id = "4"                 # at the edge again
+        self.assertEqual(self.browser.press("up", now=103.0),
+                         [("older", 2 * browse.PAGE)])  # past the gap
+        self.assertEqual(self.browser.message_id, "3")
+
+    def test_the_prefetch_stops_once_something_else_says_no(self):
+        rows = [{"id": str(n), "author": "mira", "text": "hi"}
+                for n in range(1, 6)]
+        self.browser.pane = browse.PANE_MESSAGES
+        self.browser.update(state(messages=rows), 100.0)
+        self.browser.message_id = "4"
+        self.assertEqual(self.browser.press("up", now=101.0), [])
+        self.assertEqual(self.browser.message_id, "3")
 
     def test_enter_answers_the_message_and_right_writes_a_new_one(self):
         self.browser.pane = browse.PANE_MESSAGES

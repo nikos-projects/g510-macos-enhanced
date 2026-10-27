@@ -77,8 +77,17 @@ const TICK = 1000;
 const HEARTBEAT = 10000;
 /** Messages held for paging back through, and fetched per page. */
 const PAGE = 30;
-/** A ceiling on the buffer, so a long session cannot grow without bound. */
-const MAX_HISTORY = 400;
+/** The most Discord will answer for in one request - what a page grows
+ * towards as the reader climbs further back. Asking for more than this
+ * is answered with an error rather than with more messages. */
+const PAGE_MAX = 100;
+/** A ceiling on the buffer, so a long session cannot grow without bound.
+ *
+ * High enough that a reader can climb for a long time before reaching it,
+ * because once the buffer is full the oldest page cannot be kept: `older`
+ * then has to admit there is nothing more to gain rather than asking for
+ * a page it would immediately throw away. */
+const MAX_HISTORY = 1000;
 /** How long one command call waits for the agent to have something. */
 const PULL_TIMEOUT = 25000;
 /** How long to wait before asking again when the agent is not up. */
@@ -398,12 +407,17 @@ async function push() {
 
 async function fetchOlder(limit = PAGE) {
     if (!historyChannel || !history.length) return;
+    // The panel grows its page as the reader climbs (30, 60, then as much
+    // as it can get), so `limit` arrives from the agent rather than from
+    // here - and it is clamped to what the API will actually answer for.
+    const want = Math.min(Math.max(Number(limit) || PAGE, 1), PAGE_MAX);
+    const held = history.length;
     const { body } = await RestAPI.get({
         // The leading slash matters: RestAPI builds the path itself, and
         // without it the request comes back as something that is not a
         // message list at all - which arrives as `null`.
         url: `/channels/${historyChannel}/messages`,
-        query: { limit, before: history[0].id },
+        query: { limit: want, before: history[0].id },
         retries: 2,
     });
     // The API answers newest first; the panel reads oldest first.
@@ -412,9 +426,13 @@ async function fetchOlder(limit = PAGE) {
     }
     const older = (body as any[]).slice().reverse();
     history = older.concat(history).slice(-MAX_HISTORY);
-    // A full page means there is very likely more behind it; a short one
-    // means the beginning of the channel has been reached.
-    moreBefore = older.length >= limit;
+    // A full page means there is very likely more behind it, and a short
+    // one means the beginning of the channel has been reached. The third
+    // case is the ceiling above: when the buffer could not grow, the page
+    // that just came back was fetched only to be dropped, so asking again
+    // would repeat that forever - which is how the panel used to sit on
+    // the top arrow asking for history it was never going to keep.
+    moreBefore = older.length >= want && history.length > held;
 }
 
 async function handle(command: Command) {
