@@ -197,13 +197,24 @@ function syncHistory(id: string) {
     if (id !== historyChannel) {
         historyChannel = id;
         history = fresh.slice(-PAGE);
-        // A full page behind the newest one is as much as the store will
-        // admit to without being asked; `older` is what asks.
-        moreBefore = fresh.length >= PAGE;
+        // Whether there is more history behind what the store happens to
+        // be holding is not something the store says: it loads a window
+        // into the channel, not the channel, so ten lines held can have
+        // ten thousand behind them. Reading `>= PAGE` here declared every
+        // channel with a short window to be at its beginning, and the
+        // panel - which only ever asks when this is true - never paged
+        // back at all. So this starts out believing there is more, and
+        // only a fetch that comes back short proves otherwise: `older` is
+        // what asks, and `fetchOlder` is what answers with the truth.
+        moreBefore = history.length > 0;
         return;
     }
     if (!history.length) {
         history = fresh.slice(-PAGE);
+        // The messages arrived after the switch did, so the question the
+        // branch above could not answer is answerable now - and without
+        // this it stayed false for the life of the channel.
+        moreBefore = history.length > 0;
         return;
     }
     // The store is not a queue. It refills when the channel is reopened,
