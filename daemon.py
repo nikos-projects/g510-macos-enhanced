@@ -16,6 +16,7 @@ import time
 import actions
 import alerts
 import autoscreen
+import browse
 import config
 import device
 import ipc
@@ -59,8 +60,13 @@ GESTURE_SPAN = 0.7          # presses closer together than this are one gesture
 GESTURE_HOLD = 0.45         # how long one or two presses wait before firing
 HOLD_SECONDS = 0.5          # a key down this long is a hold, not a tap
 DOUBLE_KEYS = ("L2", "L3", "L4", "L5")     # twice: freeze the screen (E1)
-HOLD_KEYS = {"L2": "menu"}  # held: the settings menu, open or shut (E2)
-# Three times: L5 writes a note (E3), L3 brings up the Discord screen (P6).
+# Held: the settings menu on L2 (E2), the Discord browser on L3 (P6b).
+# Both *open* rather than toggle - esc is how the browser is left, and a
+# second hold of L2 is how the menu is, since the triple that used to shut
+# it is gone.
+HOLD_KEYS = {"L2": "menu", "L3": "browse"}
+# Three times: L5 writes a note (E3), L3 brings up the Discord screen (P6)
+# with the keys to drive it.
 TRIPLE_KEYS = {"L5": "note", "L3": "discord"}
 MENU_IDLE = 30.0            # a menu nobody touches closes itself
 NOTE_IDLE = 30.0            # typing a note nobody finishes abandons it
@@ -154,6 +160,7 @@ class Daemon:
         self.alerts = alerts.Alerts()
         self.timers = timers.STORE
         self.alerting = False          # whether an alert has the display
+        self.held_alert = None         # the banner last kept from the browser
         self.watcher = None            # the chat reader, once it is wanted
         self.link = None               # the Vencord plugin's server, once up
         self.base_color = config.effective_color(self.config)
@@ -189,6 +196,11 @@ class Daemon:
         self.note = None
         self.note_draft = None
         self.note_touch = 0.0
+        # The Discord screen with keys (P6b): which pane, where the cursor
+        # is, what is being written. Runtime state again - browsing is a
+        # thing happening on the screen, not a setting, so the config file
+        # never learns about it either.
+        self.browse = browse.Browser()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -631,18 +643,15 @@ class Daemon:
         is down the promise it made waits (a tap that turns into a hold must
         not also change the screen), and at `HOLD_SECONDS` the hold fires
         and takes the press with it, so a finger that stays where it is
-        cannot open the menu and shut it again.
+        cannot open the menu and shut it again - or start a browser twice.
         """
         for name, state in list(self._gestures.items()):
             if name in HOLD_KEYS and name in self.lcd_pressed:
                 if now - state[1] >= HOLD_SECONDS:
                     # The hold owns the key now: drop the press, or the
-                    # next tick would find it owing a second menu.
+                    # next tick would find it owing a second answer.
                     self._gestures.pop(name, None)
-                    if self.menu.closed:
-                        self.open_menu()
-                    else:
-                        self.close_menu()
+                    self.hold_key(name)
                 continue
             if not state[2]:
                 if now - state[1] > GESTURE_SPAN:
@@ -660,6 +669,23 @@ class Daemon:
                 self.toggle_freeze(name)
             elif pending:
                 self.fire_lcd_key(name)
+
+    def hold_key(self, name):
+        """What a key *held* down means: the menu on L2, the browser on L3.
+
+        A hold is a deliberate hand, so both answers are "come up" rather
+        than "go away": leaving is a tap of esc (the browser) or a second
+        hold (the menu), which is written on the panel for the menu and in
+        the README for this.
+        """
+        action = HOLD_KEYS.get(name)
+        if action == "menu":
+            if self.menu.closed:
+                self.open_menu()
+            else:
+                self.close_menu()
+        elif action == "browse":
+            self.start_browse()
 
     def toggle_freeze(self, name=None):
         """Double press of a soft key: hold the screen where it is (E1).
@@ -1070,7 +1096,10 @@ class Daemon:
         being typed into - a letter pressed at a list still goes to the app
         underneath. Writing a note is modal the other way round: the note
         takes everything until enter or esc, because there is no list to be
-        sitting at.
+        sitting at. The Discord screen is narrower than either: only the
+        keys its pane has a use for, so a game can carry on being played at
+        with the letters while the arrows pick a channel - until a compose
+        starts, which is a note's rule and takes the lot.
         """
         if not self.menu.closed:
             if name in keytap.NAV_KEYS:
@@ -1078,7 +1107,7 @@ class Daemon:
             return bool(character) and self.menu_typing
         if self.note_draft is not None:
             return name in ("enter", "esc", "backspace") or bool(character)
-        return False
+        return self.browse.wants(name, character)
 
     def open_menu(self):
         with self.menu_lock:
@@ -1119,7 +1148,8 @@ class Daemon:
 
     def refresh_menu(self, now):
         """Keys the tap took: the menu's while it is open, the note's while
-        one is being written, and nobody's otherwise."""
+        one is being written, the Discord screen's while it is being
+        driven, and nobody's otherwise."""
         with self.menu_lock:
             if self.keytap is not None:
                 keys = self.keytap.drain()
@@ -1131,12 +1161,26 @@ class Daemon:
                 elif self.note_draft is not None:
                     for name, character in keys:
                         self.feed_note(name, character)
+                elif self.browse.active:
+                    for name, character in keys:
+                        self.feed_browse(name, character)
+                        if not self.browse.active:
+                            break                   # esc let the keys go
             if not self.menu.closed and now - self.menu_touch >= MENU_IDLE:
                 self.close_menu()
             if self.note_draft is not None and now - self.note_touch >= NOTE_IDLE:
                 self.note_draft = None
                 self.last_lcd = 0.0
                 log("note entry timed out")
+            if self.browse.typing and now - self.browse.touch >= browse.IDLE_COMPOSE:
+                # Nobody has gone on with the message: back to the
+                # messages it was answering, keys and all. The draft is
+                # dropped for the reason the note's is - a pane that is
+                # not being written into must not hold a whole keyboard
+                # away from a game.
+                self.browse.abandon()
+                self.last_lcd = 0.0
+                log("discord compose timed out")
 
     # -- the sticky note (E3) ---------------------------------------------
 
@@ -1163,14 +1207,19 @@ class Daemon:
                     return False
                 if not self.menu.closed:
                     self.close_menu()
+                if self.browse.active:
+                    # The note takes the panel, and it cannot be shown
+                    # over a screen whose keys it does not have: the
+                    # browser lets go first, the way the menu does.
+                    self.close_browse("a note took the panel")
                 self.note_draft = ""
                 self.note_touch = time.time()
                 log("note: type it, enter pins it, esc cancels")
             self.last_lcd = 0.0
         return True
 
-    def show_discord(self):
-        """Three presses of L3: put the Discord screen up.
+    def pick_discord_screen(self):
+        """Put the Discord screen up, the way picking a screen by hand is.
 
         It is a screen like any other in that `lcd.screen` names it, so
         picking it by hand is a pick: autoscreen leaves it alone for
@@ -1184,6 +1233,113 @@ class Daemon:
         self.last_lcd = 0.0
         log("LCD -> discord")
         return "discord"
+
+    def show_discord(self):
+        """Three presses of L3: the Discord screen, and the keys to drive it.
+
+        The screen on its own would still be the notification P6 shipped.
+        The point of the gesture now is that the browser is ready when the
+        finger comes off, so a channel can be picked and a message
+        answered without ever going near Discord's window - which is the
+        only reason to have it on a panel this size.
+        """
+        with self.menu_lock:
+            self.pick_discord_screen()
+            self.start_browse()
+        return "discord"
+
+    def start_browse(self):
+        """Take the keyboard for the Discord screen.
+
+        The screen comes up first if it is not up already: keys going to
+        a pane nobody can see would be keys going nowhere. Two things are
+        refused rather than taken over invisibly - a pinned note and a
+        recording, both of which own the display more than this does -
+        and each says why, because a gesture that does nothing at all is
+        one the user presses again and again.
+        """
+        with self.menu_lock:
+            lcd_config = self.config.get("lcd") or {}
+            if lcd_config.get("screen") != "discord" \
+                    or not lcd_config.get("enabled", True):
+                self.pick_discord_screen()
+            if self.record_state:
+                log("discord browse refused: something is recording")
+                return False
+            if self.note is not None:
+                log("discord browse refused: a note is pinned - clear it "
+                    "first with: g510 note clear")
+                return False
+            if not self.ensure_tap():
+                log("discord browse cannot take keys: "
+                    + (self.keytap.error if self.keytap else "no event tap"))
+                return False
+            if not self.menu.closed:
+                self.close_menu()
+            if self.browse.active:
+                return True
+            self.browse.open()
+            self.last_lcd = 0.0
+            log("discord browse on - arrows pick, enter opens, esc lets go")
+            return True
+
+    def close_browse(self, reason=""):
+        """Hand the keys back to whatever else wants them."""
+        with self.menu_lock:
+            if not self.browse.active:
+                return False
+            self.browse.close()
+            self.last_lcd = 0.0
+            log("discord browse off" + (f" - {reason}" if reason else ""))
+            return True
+
+    def feed_browse(self, name, character):
+        """One key the tap took while the Discord screen is being driven."""
+        with self.menu_lock:
+            state = self.link.state() if self.link is not None else {}
+            now = time.time()
+            self.browse.update(state, now)
+            for action in self.browse.press(name, character, now):
+                self.run_browse(action, now)
+            if self.browse.active:
+                self.last_lcd = 0.0
+
+    def run_browse(self, action, now=None):
+        """One thing the browser asked for, on its way to the plugin.
+
+        The pane queues *what* and decides nothing about how: the link,
+        the connection check and the log all live here, so wanting a
+        channel is a line in the log and, when the plugin is not there, a
+        reason on the panel rather than silence.
+        """
+        kind = str(action[0])
+        payload = {"action": kind}
+        if kind in ("open", "list"):
+            payload["name"] = str(action[1])
+        elif kind == "older":
+            payload["limit"] = int(action[1])
+        elif kind == "suggest":
+            payload["text"] = str(action[1])
+        elif kind == "say":
+            payload["text"] = str(action[1])
+        elif kind == "reply":
+            payload["id"], payload["text"] = str(action[1]), str(action[2])
+        else:
+            return
+        reply = self.vencord_command(payload) or {}
+        if not reply.get("ok"):
+            problem = str(reply.get("error") or "that did not work")
+            log(f"discord {kind}: {problem}")
+            self.browse.set_error(problem, now)
+            return
+        if kind == "suggest":
+            return                      # one log line per keystroke is noise
+        detail = str(payload.get("name") or payload.get("id") or "")
+        log(f"discord {kind}" + (f" {detail}" if detail else ""))
+        if kind in ("say", "reply"):
+            # Whose answer matters: the next ack with this number or past
+            # it is the one saying whether the message went out.
+            self.browse.sent(reply.get("n"), now)
 
     def vencord_command(self, payload):
         """What `g510 discord ...` asks of the plugin behind the screen.
@@ -1199,6 +1355,18 @@ class Daemon:
             "state": {}, "waiting": 0, "port": 0, "seen": None}
         if action == "state":
             return {"ok": True, **status}
+        if action == "browse":
+            # Whether the keys belong to the screen is this process's own
+            # runtime state - the config file and the plugin both know
+            # nothing about it - so starting it and reporting it happen
+            # here, before any connection to Discord is asked about.
+            want = payload.get("on")
+            if want is None:
+                return {"ok": True, "active": self.browse.active}
+            if bool(want):
+                return {"ok": True, "active": self.start_browse()}
+            self.close_browse("asked for")
+            return {"ok": True, "active": False}
         if not status.get("connected"):
             # The plugin pushes once a second while Discord is running, so
             # "not seen for a while" is the whole diagnosis.
@@ -1246,8 +1414,23 @@ class Daemon:
             number = self.link.send({"cmd": "reply", "id": target,
                                      "text": text})
             return {"ok": True, "n": number, "status": status}
+        if action == "list":
+            # Which list of channels the panel walks: the DMs or one
+            # server. The client's own view does not move - a server can
+            # be read here without Discord being dragged over to it.
+            wanted = str(payload.get("name") or "").strip()
+            if not wanted:
+                return {"ok": False, "error": "no list given"}
+            number = self.link.send({"cmd": "list", "id": wanted})
+            return {"ok": True, "n": number, "status": status}
+        if action == "suggest":
+            # Whoever fits the word being written - people, roles, and
+            # @everyone - asked for one word at a time as it is typed.
+            number = self.link.send(
+                {"cmd": "suggest", "text": str(payload.get("text") or "")})
+            return {"ok": True, "n": number, "status": status}
         return {"ok": False, "error": f"unknown action {action!r}. "
-                "Try: state open older say reply"}
+                "Try: state open older say reply list suggest browse"}
 
     def feed_note(self, name, character):
         """One key while a note is being written. `enter` pins it."""
@@ -1485,22 +1668,38 @@ class Daemon:
 
     def refresh_lcd(self, now):
         lcd_config = self.config.get("lcd", {})
+        if self.browse.active and (
+                not lcd_config.get("enabled", True)
+                or lcd_config.get("screen") != "discord"):
+            # The browser holds the keyboard, so it may only ever be up
+            # behind a panel it is actually showing. A soft key, the CLI
+            # or a rule moving the display elsewhere is the display
+            # saying it has something else to be - so the keys go in the
+            # same breath, or a pane nobody can see would go on swallowing
+            # arrows from a game.
+            if lcd_config.get("enabled", True):
+                self.close_browse("the display moved to another screen")
+            else:
+                self.close_browse("the display was switched off")
         menu_open = not self.menu.closed
         note = self.note_active
+        browsing = self.browse.active
         if not lcd_config.get("enabled", True) and not (menu_open or note):
             # Blank: nothing to keep in step, so autoscreen forgets what it
             # last put up and takes the config as it finds it when the
             # display comes back. The menu is exempt - it is how the display
             # gets turned back on - and so is a note, because the key press
             # that put it there has to be visible while it is answered.
+            # (A browser never gets here: it is closed above.)
             self.autoscreen.rest()
             return
-        if self.record_state or menu_open or note:
-            # MR while it records, the menu while it is open and a note
-            # while it is up own the display, so autoscreen stands down
-            # rather than switching under them. Between them they cover
-            # every moment, so the screen underneath is never touched and
-            # simply comes back.
+        if self.record_state or menu_open or note or browsing:
+            # MR while it records, the menu while it is open, a note
+            # while it is up and the browser while it is being driven all
+            # own the display, so autoscreen stands down rather than
+            # switching under them. Between them they cover every moment,
+            # so the screen underneath is never touched and simply comes
+            # back.
             self.autoscreen.rest()
         else:
             self.refresh_autoscreen(now)
@@ -1514,6 +1713,20 @@ class Daemon:
         # still there.
         alert = None if (self.record_state or menu_open) else \
             self.alerts.current(now)
+        if alert and browsing:
+            # The browser is the one thing an alert must not borrow the
+            # display from. It holds the keys precisely so a message can
+            # be read, so a banner over the top would cover the very text
+            # it was opened for: it waits the way it does behind the menu
+            # and a recording, and because the queue prunes itself against
+            # the moment it is next asked, a banner nobody could have seen
+            # is gone by the time the keys come back rather than popping
+            # up over a read that finished. Only the sight of it is given
+            # up - the sound has rung already.
+            if self.held_alert != alert["until"]:
+                self.held_alert = alert["until"]
+                log("banner held back - the browser has the keys")
+            alert = None
         if bool(alert) != self.alerting:
             self.alerting = bool(alert)
             self.last_lcd = 0.0          # one starts or ends: draw it now
@@ -1522,7 +1735,14 @@ class Daemon:
         self.last_lcd = now
         # What the plugin last said, in reach of every screen below: the
         # Discord screen draws it, and any other screen ignores it.
-        self.state["discord"] = self.link.state() if self.link else {}
+        discord_state = self.link.state() if self.link else {}
+        self.state["discord"] = discord_state
+        if browsing:
+            # One pass over the newest push here rather than on every key:
+            # what the browser waits for - a channel opening, a list
+            # arriving, an acknowledgement - has no key attached to it,
+            # and a redraw is exactly often enough to notice it.
+            self.browse.update(discord_state, now)
         if menu_open:
             with self.menu_lock:
                 self.state["menu"] = self.menu.view()
@@ -1555,6 +1775,17 @@ class Daemon:
                 finally:
                     self.state.pop("note", None)
                     self.state.pop("note_entry", None)
+            elif browsing:
+                # The browser does not borrow the display the way an alert
+                # does: it *is* the Discord screen, walked with keys, so
+                # `lcd.screen` stays "discord" underneath it the whole
+                # time and letting go of the keys is all it takes to be
+                # back to reading it.
+                self.state["browse"] = self.browse.view()
+                try:
+                    pixels = screens.render("discord", self.state)
+                finally:
+                    self.state.pop("browse", None)
             else:
                 pixels = screens.render(lcd_config.get("screen", "status"),
                                         self.state)

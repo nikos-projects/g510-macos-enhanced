@@ -62,11 +62,13 @@ follow the Linux `hid-lg-g15` driver and `libg15`.
   store macOS writes it into: no permission, no window to read, about five
   seconds behind and never in pieces
 - **The Discord screen** - three presses of L3 shows the conversation
-  itself: the channel you are in, its newest message, unread and mention
-  marks over the channel list, pages of history behind it, and
-  `g510 discord say|reply` writing back into it - read from inside the
-  client by our own Vencord plugin, so Vesktop (or another Vencord build)
-  is what this one asks for
+  itself and hands over the keys: the channel you are in, its newest
+  message, unread and mention marks over the channel list, pages of
+  history behind it - and with the arrows you can pick another channel,
+  answer a message, or ping a person or a role, all without leaving the
+  game. `g510 discord say|reply` writes in from a shell too. Read from
+  inside the client by our own Vencord plugin, so Vesktop (or another
+  Vencord build) is what this one asks for
 
 ## 3D printer progress
 
@@ -183,8 +185,9 @@ rather than a tap, so nothing fires on the way to a gesture:
     one press     what the key is set to - a screen, the cycle, off
     two presses   L2-L5: freeze the screen where it is
     held down     L2: the menu below, and holding it again shuts it
+    held down     L3: the Discord screen with the keys to drive it
     three         L5: a sticky note
-    three         L3: the Discord screen (see below)
+    three         L3: the Discord screen, and the keys to drive it
 
 A **frozen** screen is autoscreen standing still: the rules go on reading the
 machine, they just get no say until the same double press lets go. It is what
@@ -641,7 +644,9 @@ into the client. Not a bot account, not a user token, not a
 screen-scrape: it reads Discord's own stores over Discord's own API, and
 what it finds is what the window is drawing anyway.
 
-Three presses of L3 puts the screen up. It is in `SCREENS` so it can be
+Three presses of L3 puts the screen up *and hands it the keyboard*, so
+the panel becomes a small Discord browser rather than a notification -
+see "Driving it from the keys" below. It is in `SCREENS` so it can be
 named - by the gesture, by `g510 lcd discord`, by a rule - but not in the
 default cycle, so it never turns up on its own:
 
@@ -667,6 +672,7 @@ three rows, because that is all the panel has.
                                  "friends" for the list of them
     g510 discord say <text>      send it in the channel that is open
     g510 discord reply <#ref|last> <text>   send it as a reply
+    g510 discord browse [on|off] give the panel the keys, or take them back
 
 `open` matches an id, a whole name or a prefix of one, case not
 mattering, and a name fitting more than one channel is refused with the
@@ -700,6 +706,74 @@ key - while Vesktop sits behind whatever else is on screen.
       "port": 47832      must equal HOST in vencord/g510/index.ts
     }
 
+### Driving it from the keys
+
+The screen is not only something to look at. Three presses of L3 puts it
+up *and* takes the keyboard, so a channel can be picked, a message
+answered and a person or a role pinged with the arrow keys - the game
+never loses the front of the screen, and Discord's own window never comes
+forward. Hold L3 to take the keys again after letting go of them.
+
+Nothing is written to the config file to make this happen: which pane is
+open, where the cursor is and what is being typed all live in the agent
+for as long as the browsing does.
+
+Three panes, and the keys move between them:
+
+    channels   the list of channels, three at a time with the one under
+               the cursor in the middle. Up and down walk it; left and
+               right switch which list it is - the direct messages, then
+               each server in sidebar order, without Discord's own view
+               moving. Enter opens the channel under the cursor.
+    messages   one message at a time, newest first. Up and down move
+               through them, asking the plugin for the page behind the
+               oldest when there is more history. Enter answers the
+               message on show; right writes a new one instead; left goes
+               back to the channels.
+    compose    the message itself. Enter sends, esc throws the draft
+               away. Typing an @ starts a mention: the plugin offers the
+               people, the roles, @everyone and @here that fit the word,
+               up and down choose between them and enter puts one into
+               the text - sent as the code Discord reads, shown on the
+               panel as the name it belongs to.
+
+A message longer than the two lines it is given scrolls itself: the
+first window sits still long enough to be read, then the text climbs a
+line at a time until it has all gone past - and moving to another
+message, or a new one arriving under the cursor, starts that one again
+from its first line. There is no key spare to spend on scrolling, since
+the arrows are what move between messages.
+
+While browsing, the panel only takes the keys its pane has a use for: the
+arrows, enter and esc - so letters still reach the game underneath. The
+moment a compose starts it takes the lot, the same as writing a note,
+because there is no game worth playing at with a sentence half typed.
+Cmd and the other shortcut modifiers are never touched at all, which is
+how the panel is left again from anywhere. Esc is that key: it hands the
+keys back and leaves the screen up as a viewer.
+
+Two things it will not take over, because they own the display more than
+it does - a pinned note, and MR while it records. Each says why rather
+than doing nothing, and pinning a note while browsing lets the browser go
+first. The display moving to another screen, or being switched off,
+closes the browser in the same breath: a pane nobody can see must not go
+on swallowing arrows from a game.
+
+A notification is a third thing it keeps the pane from. A banner over
+the top would cover the very message the browser was opened to read, so
+it waits the way it does behind the menu - the sound still rings, only
+the sight of it holds off, and it expires in place rather than turning
+up over a read that has moved on. The log says
+`banner held back - the browser has the keys` once when it happens.
+
+    g510 discord browse            is the keyboard being taken or not
+    g510 discord browse on         take it (what three presses of L3 do)
+    g510 discord browse off        give it back
+
+A draft nobody goes on with for a minute is dropped, back to the
+messages, for the reason an unfinished note is: a pane that is not being
+written into must not hold a whole keyboard away from a game.
+
 ### How it gets to the panel
 
 Discord holds every conversation in memory in its own stores, and
@@ -728,8 +802,15 @@ has no way to read the config file.
 
 ### Building it
 
-The plugin's source lives in this tree; it is copied into a Vencord
-checkout to be built, and Vencord is pointed at from Vesktop:
+The plugin's source lives in this tree; `vencord/build.sh` copies it
+into a Vencord checkout, builds it, and points Vesktop at the result:
+
+    VENCORD=~/Documents/Vencord ./vencord/build.sh
+
+That is the same as the three steps below, plus writing `vencordDir` for
+Vesktop and refusing to do that while Vesktop is running - it would
+overwrite the file on the way out. Needs node and pnpm; Vencord names
+the pnpm it wants, so corepack fetches it.
 
     cp -R vencord/g510 ~/Documents/Vencord/src/userplugins/
     cd ~/Documents/Vencord && pnpm install && pnpm build
@@ -749,12 +830,14 @@ been since the last push.
 ### What it does not do
 
 - **Only the channel the client is on is followed live.** Messages in
-  other channels are what the list's `*` and `@` marks are for; `open`
-  is how you get to them.
-- **History is fetched, not watched.** `older` asks Discord for a page
-  behind what is held; nothing behind that is read until it is asked for.
+  other channels are what the list's `*` and `@` marks are for; `open` -
+  or the arrow keys, once the screen has them - is how you get to them.
+- **History is fetched, not watched.** `older`, or up-arrow at the oldest
+  message, asks Discord for a page behind what is held; nothing behind
+  that is read until it is asked for.
 - **No reactions, edits, attachments or typing state** - the last line is
-  the message's text and who said it, at panel width.
+  the message's text and who said it, at panel width. Sending is plain
+  text: a mention is the only markup that goes in.
 - **Vesktop has to be open.** The plugin runs inside the client, so a
   closed client is `not connected` on the CLI and "waiting for Vesktop"
   on the screen.

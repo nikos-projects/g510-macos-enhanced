@@ -42,10 +42,13 @@
  */
 import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
+import type { Message } from "@vencord/discord-types";
 import definePlugin from "@utils/types";
 import {
     ChannelRouter,
     ChannelStore,
+    GuildMemberStore,
+    GuildRoleStore,
     GuildStore,
     MessageStore,
     NavigationRouter,
@@ -53,6 +56,7 @@ import {
     RestAPI,
     SelectedChannelStore,
     SelectedGuildStore,
+    SortedGuildStore,
     UserStore,
 } from "@webpack/common";
 
@@ -79,6 +83,10 @@ const MAX_HISTORY = 400;
 const PULL_TIMEOUT = 25000;
 /** How long to wait before asking again when the agent is not up. */
 const PULL_RETRY = 2000;
+/** How many people and roles one mention is offered. The panel shows
+ * three at a time and arrows through the rest, so this is a ceiling on
+ * what one push of state has to carry rather than a limit anybody sees. */
+const SUGGEST_LIMIT = 40;
 
 interface Command {
     n: number;
@@ -103,6 +111,26 @@ let historyChannel = "";
 let moreBefore = false;
 /** The last command this side ran, so the panel can see it happened. */
 let ack: { n: number; ok: boolean; error?: string } | null = null;
+/** Which list of channels `channels` is for: `"@me"` or one server id,
+ * and `null` for "whatever the client has open".
+ *
+ * Walking servers with the arrow keys must not drag Discord's own view
+ * along with it - the whole point of this screen is reading one conversation
+ * without the window ever coming forward. So a list the panel asked for
+ * stays put until it asks for another, and `open` is what puts it back to
+ * following: opening a channel is the one command here that does move the
+ * client.
+ */
+let listId: string | null = null;
+/** The last answer to "whoever fits this word being written".
+ *
+ * Carried with the word it belongs to (`for`) because commands are not
+ * instant: a list offered for a word that has already moved on would put
+ * the wrong person in the text, so the panel only ever uses the answer to
+ * the word it is on.
+ */
+let suggestion: { for: string; items: { label: string; insert: string; }[]; } =
+    { for: "", items: [] };
 
 function channelName(channel: any): string {
     if (!channel) return "";
@@ -136,6 +164,10 @@ function shape(message: any, mine: string) {
         time: stamp(message.timestamp),
         reply: message.messageReference
             ? String(message.messageReference.message_id ?? "") : "",
+        // Left null here; gather() fills it in for the messages whose target
+        // it is actually holding, which is the only case worth a name on a
+        // panel this size.
+        reply_to: null as string | null,
     };
 }
 
@@ -195,34 +227,113 @@ function syncHistory(id: string) {
     history = merged.slice(-MAX_HISTORY);
 }
 
-function channelList(current: string) {
-    const out: any[] = [];
-    for (const channel of ChannelStore.getSortedPrivateChannels()) {
-        out.push({
-            id: channel.id,
-            name: channelName(channel),
-            dm: true,
-            unread: !!ReadStateStore.hasUnread(channel.id),
-            mentions: ReadStateStore.getMentionCount(channel.id) || 0,
-            current: channel.id === current,
-        });
+function channelRow(channel: any, current: string) {
+    return {
+        id: channel.id,
+        name: channelName(channel),
+        dm: channel.type === 1 || channel.type === 3,
+        unread: !!ReadStateStore.hasUnread(channel.id),
+        mentions: ReadStateStore.getMentionCount(channel.id) || 0,
+        current: channel.id === current,
+    };
+}
+
+/** The list the panel walks - the DMs, or every text channel of one
+ * server, in the order that server's own sidebar uses.
+ *
+ * `getChannelIds` hands back ids in no order anybody could walk with an
+ * arrow key, which is what first made the list useless for browsing: the
+ * channels are put back into the shape the sidebar draws them in,
+ * categories first and channels by position underneath.
+ */
+function channelList(current: string, guildId: string) {
+    if (guildId === "@me") {
+        // Already sorted by the store: whoever was written to last.
+        return ChannelStore.getSortedPrivateChannels()
+            .map((channel: any) => channelRow(channel, current));
     }
-    const guildId = SelectedGuildStore.getGuildId();
-    if (guildId) {
-        for (const id of ChannelStore.getChannelIds(guildId)) {
-            const channel = ChannelStore.getChannel(id);
-            if (!channel || channel.type !== 0) continue;   // text only
-            out.push({
-                id: channel.id,
-                name: channelName(channel),
-                dm: false,
-                unread: !!ReadStateStore.hasUnread(id),
-                mentions: ReadStateStore.getMentionCount(id) || 0,
-                current: id === current,
-            });
-        }
+    const channels: any[] = [];
+    for (const id of ChannelStore.getChannelIds(guildId)) {
+        const channel = ChannelStore.getChannel(id);
+        // Text channels only: voice has no conversation to read here and
+        // would sit in the list as a channel that opens nothing.
+        if (!channel || channel.type !== 0) continue;
+        channels.push(channel);
+    }
+    const parentPosition = (channel: any) => {
+        const parent = channel.parent_id
+            ? ChannelStore.getChannel(channel.parent_id) : null;
+        return parent ? Number(parent.position) || 0 : -1;
+    };
+    channels.sort((a: any, b: any) =>
+        parentPosition(a) - parentPosition(b)
+        || (Number(a.position) || 0) - (Number(b.position) || 0)
+        || String(a.name ?? "").localeCompare(String(b.name ?? "")));
+    return channels.map((channel: any) => channelRow(channel, current));
+}
+
+/** Every list there is to walk: the DMs first, then the servers in the
+ * order the sidebar holds them. The client is not moved by any of this. */
+function guildLists(active: string) {
+    const out: any[] = [{ id: "@me", name: "DMs", current: active === "@me" }];
+    for (const id of SortedGuildStore.getFlattenedGuildIds()) {
+        const guild = GuildStore.getGuild(id);
+        if (!guild) continue;
+        out.push({ id, name: guild.name, current: id === active });
     }
     return out;
+}
+
+/** The list this panel would be showing if it were following the client:
+ * whatever holds whatever is open, falling back to the last server used. */
+function followList(): string {
+    const id = SelectedChannelStore.getChannelId();
+    const channel = id ? ChannelStore.getChannel(id) : null;
+    if (channel) return channel.guild_id ?? "@me";
+    return SelectedGuildStore.getGuildId() || "@me";
+}
+
+/** Whoever fits the word after an @ - people, roles, @everyone and
+ * @here, for the channel this is being written into.
+ *
+ * Read out of the stores rather than searched for over the API: this
+ * runs on every keystroke, and the members a server has actually shown
+ * this client are exactly the ones worth offering first. A DM has no
+ * roles and nobody to ping who is not already in it, so it answers with
+ * nothing rather than with suggestions that could not be sent.
+ */
+function findSuggestions(partial: string) {
+    const id = SelectedChannelStore.getChannelId();
+    const channel = id ? ChannelStore.getChannel(id) : null;
+    const guildId = channel?.guild_id;
+    if (!guildId) return { for: partial, items: [] };
+    const word = partial.toLowerCase();
+    const items: { label: string; insert: string; rank: number; }[] = [];
+    const offer = (label: string, insert: string) => {
+        const lower = String(label).toLowerCase();
+        if (word && !lower.includes(word)) return;
+        // Names that begin with what has been typed come first, which is
+        // the order every mention box anyone has ever used uses.
+        items.push({ label: String(label), insert, rank: lower.startsWith(word) ? 0 : 1 });
+    };
+    offer("everyone", "<@everyone>");
+    offer("here", "<@here>");
+    for (const role of GuildRoleStore.getSortedRoles(guildId)) {
+        if (role.name === "everyone" || role.id === guildId) continue;
+        offer(role.name, `<@&${role.id}>`);
+    }
+    for (const member of GuildMemberStore.getMembers(guildId)) {
+        const user = UserStore.getUser(member.userId);
+        offer(user?.globalName || user?.username || member.nick
+            || member.userId, `<@${member.userId}>`);
+    }
+    items.sort((a, b) => a.rank - b.rank
+        || a.label.localeCompare(b.label));
+    return {
+        for: partial,
+        items: items.slice(0, SUGGEST_LIMIT)
+            .map(({ label, insert }) => ({ label, insert })),
+    };
 }
 
 function gather() {
@@ -241,18 +352,31 @@ function gather() {
                      || "?") : null;
         return row;
     });
+    if (listId && listId !== "@me" && !GuildStore.getGuild(listId)) {
+        // A server left while it was being read: back to following the
+        // client rather than showing a list that can never fill again.
+        listId = null;
+    }
+    const active = listId ?? followList();
     return {
         plugin: "g510",
-        v: 1,
+        v: 2,
         channel: channel
             ? { id: channel.id, name: channelName(channel), dm: channel.type === 1 || channel.type === 3 }
             : null,
-        channels: channelList(id ?? ""),
+        // Which list the channels below belong to, and every list there
+        // is to walk to with the panel's left and right keys.
+        list: active,
+        lists: guildLists(active),
+        channels: channelList(id ?? "", active),
         messages: shaped,
         // Whether there is older history behind what the panel is holding:
         // a full page in the store, or a full page the last `older` came
         // back with.
         has_more: moreBefore,
+        // Whoever fits the word being written, with the word it is for -
+        // see `suggestion`.
+        suggest: suggestion,
         ack,
     };
 }
@@ -303,6 +427,19 @@ async function handle(command: Command) {
             } else if (command.id) {
                 ChannelRouter.transitionToChannel(command.id);
             }
+            // Opening is the one command here that moves Discord, so the
+            // panel's list goes back to following it: from now on the
+            // channels it walks and the conversation the client is in are
+            // the same place.
+            listId = null;
+            break;
+        case "list":
+            // Walk somewhere else without moving the client: this is a
+            // command about reading, and nothing else about it changes.
+            listId = command.id || null;
+            break;
+        case "suggest":
+            suggestion = findSuggestions(command.text ?? "");
             break;
         case "older":
             await fetchOlder(command.limit);
@@ -320,13 +457,20 @@ async function handle(command: Command) {
                 // Discord's own send reads it from; in the message body it
                 // is simply not looked at, and the reply lands as an
                 // ordinary message.
+                //
+                // fail_if_not_exists is a fourth field Discord really takes
+                // (Vencord's own type stops at the three ids): with it off,
+                // replying to a message that got deleted while this row sat
+                // on the panel still sends, instead of erroring the whole
+                // send away.
+                const reference = {
+                    message_id: command.id,
+                    channel_id: id,
+                    guild_id: channel?.guild_id,
+                    fail_if_not_exists: false,
+                } as Message["messageReference"];
                 await sendMessage(id, { content: command.text }, true, {
-                    messageReference: {
-                        message_id: command.id,
-                        channel_id: id,
-                        guild_id: channel?.guild_id,
-                        fail_if_not_exists: false,
-                    },
+                    messageReference: reference,
                 });
             }
             break;
@@ -375,7 +519,16 @@ async function pull() {
 export default definePlugin({
     name: "G510",
     description: "Hands Discord's own view of the conversation to the G510 panel",
-    authors: [{ name: "g510", id: 0n }],
+    // The credits. Vencord has no field of its own for them - the authors
+    // line is what the plugin's page shows - and `id: 0n` is its way of
+    // saying "a name with nobody to look up", so all four are shown as
+    // they are written here rather than fetched as users.
+    authors: [
+        { name: "g510", id: 0n },
+        { name: "Niko", id: 0n },
+        { name: "MiMo-V2.6-Flash (OpenCode)", id: 0n },
+        { name: "g510-macos-enhanced team", id: 0n },
+    ],
     enabledByDefault: true,
 
     start() {
@@ -398,5 +551,12 @@ export default definePlugin({
         historyChannel = "";
         moreBefore = false;
         ack = null;
+        // Start over on the next load: which list the panel was walking and
+        // who was last offered as a mention are both things a fresh session
+        // has no business inheriting - a stale `listId` would show a server
+        // nobody asked for, and a stale suggestion would offer a name for a
+        // word that has long since been deleted.
+        listId = null;
+        suggestion = { for: "", items: [] };
     },
 });

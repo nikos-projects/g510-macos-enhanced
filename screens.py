@@ -776,11 +776,18 @@ def screen_message(canvas, state):
 def screen_discord(canvas, state):
     """The conversation, as the Vencord plugin last reported it.
 
-    Two shapes, because there are two things worth showing: the message
-    that is on top of the channel you are in, and - when nothing is
-    selected, or the plugin has not connected yet - what there is to pick
-    from. Both fit the three lines every other screen gets.
+    Three shapes, because there are three things worth showing: the screen
+    while its keys are being used to walk it (a channel picked, a message
+    answered, a mention written - `browse.Browser` decides what goes in
+    here), the message that is on top of the channel you are in, and -
+    when nothing is selected, or the plugin has not connected yet - what
+    there is to pick from. All three fit the three lines every other
+    screen gets.
     """
+    view = state.get("browse")
+    if view:
+        _browse(canvas, view)
+        return
     data = state.get("discord") or {}
     corner = time.strftime("%H:%M")
     if not data:
@@ -822,6 +829,150 @@ def screen_discord(canvas, state):
             ("@" if row.get("mentions") else
              ("*" if row.get("unread") else " "))
         canvas.text(_fit(canvas, mark + name, 10), 2, 13 + index * 10, 10)
+
+
+def _tail(canvas, string, size):
+    """The *end* of a line, cut from the left.
+
+    `_fit` keeps the head, which is right for reading a message and wrong
+    for writing one: what is being typed sits at the right of the line, so
+    the half that has already run off is exactly the half the caret is in.
+    An ellipsis marks that something was cut, the same way `_fit` does.
+    """
+    limit = LCD_WIDTH - 4
+    out = str(string)
+    cut = False
+    while out and canvas.measure("..." + out if cut else out, size) > limit:
+        out = out[1:]
+        cut = True
+    return ("..." + out) if cut else out
+
+
+def _wrap_tail(canvas, text, size, lines=3):
+    """Break text across `lines` of the panel, keeping the *end* of it.
+
+    `_wrap` word-wraps and, when a word is wider than the panel, keeps its
+    head with an ellipsis - right for reading a message, wrong for writing
+    one. What is being typed sits at the right of the last line, so the half
+    that has already run off is exactly the half the caret is in, and a long
+    URL or a run of unbroken characters would otherwise hide the caret
+    entirely. So the lines are taken from the end backwards and cut wherever
+    they overflow, and what was dropped off the front is marked with "...".
+    """
+    limit = LCD_WIDTH - 4
+    out, rest = [], str(text)
+    while rest and len(out) < lines:
+        if canvas.measure(rest, size) <= limit:
+            out.append(rest)
+            break
+        cut = rest
+        while cut and canvas.measure(cut, size) > limit:
+            cut = cut[1:]
+        if not cut:
+            break
+        out.append(cut)
+        rest = rest[:len(rest) - len(cut)]
+    out.reverse()
+    if rest and out:
+        out[0] = "..." + out[0]
+    return out
+
+
+def _browse(canvas, view):
+    """The Discord screen while the keys belong to it.
+
+    A header and three rows, the same budget every other screen has, and
+    each pane spends it on one thing: three channels with the one under
+    the cursor in the middle; one message at a time with its words wrapped
+    underneath; or a draft, with the suggestions it has opened below it
+    while an @ is being written. A refusal from the plugin goes over the
+    second row for a few seconds, because "nothing happened" without a
+    reason is the one answer a panel this small must never give.
+    """
+    corner = time.strftime("%H:%M")
+    mode = str(view.get("mode") or "channels")
+    title = _fit(canvas, str(view.get("title") or "DISCORD"), 10)
+    right = str(view.get("count") or "")
+    draft = str(view.get("draft") or "")
+    picks = view.get("picks") or []
+
+    if mode == "compose" and not picks:
+        # The header says who this is going to rather than where in
+        # anything the user is: an answer, or a fresh message.
+        reply = view.get("reply")
+        right = _fit(canvas, f"re: {reply}" if reply else "new", 10)
+        canvas.text(title, 2, 0, 10)
+        canvas.text(right, LCD_RIGHT - canvas.measure(right, 10), 1, 10)
+        for index, line in enumerate(_wrap_tail(canvas, draft + "_", 10, 3)):
+            canvas.text(line, 2, 13 + index * 10, 10)
+    elif mode == "compose":
+        # A suggestion is on offer, so the draft takes the header row -
+        # the tail of it, because the word being completed is at the end -
+        # and the list gets the three rows under it.
+        canvas.text(_tail(canvas, draft + "_", 10), 2, 1, 10)
+        if right:
+            canvas.text(right, LCD_RIGHT - canvas.measure(right, 10), 1, 10)
+        for index, row in enumerate(picks):
+            mark = ">" if row.get("cursor") else " "
+            label = _fit(canvas, mark + " " + str(row.get("label") or "?"),
+                         14)
+            canvas.text(label, 2, 14 + index * 10, 10)
+    else:
+        canvas.text(title, 2, 0, 10)
+        canvas.text(right or corner,
+                    LCD_RIGHT - canvas.measure(right or corner, 10), 1, 10)
+        waiting = str(view.get("waiting") or "")
+        if waiting:
+            canvas.text(_fit(canvas, waiting, 14), 2, 17, 12)
+        elif mode == "messages":
+            if view.get("empty"):
+                canvas.text("no messages", 2, 17, 12)
+            else:
+                # The `>` is the cursor: it says which message the keys
+                # are on, which is what enter would answer.
+                #
+                # Everything below the header is spent on the message, and
+                # the panel has 43 rows to spend it in: a line drawn at
+                # `y` puts its ink at `y + 1 .. y + size + 1`, so the two
+                # lines of a message have to start at 21 and 32 or the
+                # second one loses the bottom of its letters to the edge -
+                # which is exactly what it used to do at 27 and 36, where
+                # five rows of a nine-row line were all that was left.
+                # The author takes the rows the header leaves, at the size
+                # that lets both lines have theirs.
+                canvas.text(_fit(canvas, "> " + str(view.get("author") or "?"),
+                                 11), 2, 11, 9)
+                # The whole message, wrapped, and then the two lines of it
+                # the panel has room for: `scroll` is how far the browser
+                # has already carried the reader down it, so a message
+                # longer than the panel goes on being read a piece at a
+                # time instead of ending in "..." out of reach.
+                lines = _wrap(canvas, str(view.get("text") or "(empty)"),
+                              10, None)
+                window = _window(canvas, lines, view.get("scroll"))
+                if window:
+                    canvas.text(window[0], 2, 21, 10)
+                if len(window) > 1:
+                    canvas.text(window[1], 2, 32, 9)
+        else:
+            rows = view.get("rows") or []
+            if not rows:
+                canvas.text("no channels here", 2, 17, 12)
+            for index, row in enumerate(rows):
+                # A space after the mark, the same as the messages pane
+                # puts after its ">", so the names line up down the column.
+                marked = str(row.get("mark") or " ") + " " \
+                    + str(row.get("name") or "?")
+                canvas.text(_fit(canvas, marked, 10), 2, 13 + index * 10, 10)
+
+    error = str(view.get("error") or "")
+    if error:
+        # Over whatever is underneath: an error is news, and the rows it
+        # covers are still there the moment it goes. The messages pane
+        # starts its first line two rows above where the other two start
+        # theirs, so it is that line the refusal has to sit on.
+        canvas.text("!" + _fit(canvas, error, 15), 2,
+                    11 if mode == "messages" else 13, 10)
 
 
 def screen_menu(canvas, state):
@@ -871,11 +1022,12 @@ def screen_note(canvas, state):
 
 def _wrap(canvas, text, size, lines=2):
     """Break text across up to `lines` of the panel, cutting what will not
-    fit and saying so."""
+    fit and saying so. `lines=None` wraps all of it instead, which is what
+    a caller that means to show a window of its own asks for."""
     limit = LCD_WIDTH - 4
     words = str(text).split()
     out, current, index = [], "", 0
-    while index < len(words) and len(out) < lines:
+    while index < len(words) and (lines is None or len(out) < lines):
         candidate = words[index] if not current else f"{current} {words[index]}"
         if canvas.measure(candidate, size) <= limit:
             current, index = candidate, index + 1
@@ -886,13 +1038,34 @@ def _wrap(canvas, text, size, lines=2):
             continue
         out.append(_fit(canvas, words[index], size))     # one word, too wide
         current, index = "", index + 1
-    if current and len(out) < lines:
+    if current and (lines is None or len(out) < lines):
         out.append(current)
     if index < len(words) and out:
         # Something was left over: say so rather than let the panel cut a
         # sentence off as though it had ended there.
         out[-1] = _fit(canvas, out[-1] + " ...", size)
     return out[:lines]
+
+
+def _window(canvas, lines, scroll):
+    """The two lines of `lines` to draw, starting at `scroll`.
+
+    The start is held inside what is actually there, so a scroll that has
+    run past the end of a short message simply shows its last two lines -
+    the browser counts lines it cannot see, and only the panel knows how
+    many there really are. Anything left below the window is said so the
+    way `_wrap` says it when it cuts a message short, because a panel that
+    went quiet at the bottom of a message would read as the end of it.
+    """
+    try:
+        start = int(scroll or 0)
+    except (TypeError, ValueError):
+        start = 0
+    start = max(0, min(start, max(0, len(lines) - 2)))
+    out = list(lines[start:start + 2])
+    if out and start + len(out) < len(lines):
+        out[-1] = _fit(canvas, out[-1] + " ...", 10)
+    return out
 
 
 LCD_RIGHT = 158

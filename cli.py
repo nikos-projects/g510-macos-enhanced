@@ -100,6 +100,9 @@ USAGE = """g510 - control a Logitech G510 keyboard on macOS
   g510 discord reply <#ref|last> <text>
                                send it as a reply to one message; the
                                #ref is what history prints beside it
+  g510 discord browse [on|off] give the panel's keys to the Discord
+                               screen: arrows pick channels and messages,
+                               enter answers, esc gives the keys back
 
   g510 bank [1|2|3]             show or switch the binding bank (M1/M2/M3)
   g510 switch [on|off <action>] what the joystick switch does
@@ -1522,6 +1525,23 @@ def _discord_client(head, rest):
         print(f"  {channel.get('name') or '?'}")
         return
 
+    # Reading and writing are the plugin's; the browser is the agent's own
+    # runtime state, so it answers whether the keys are taken or not even
+    # when Vesktop is not running at all.
+    if head == "browse":
+        want = None
+        if rest:
+            word = rest[0].lower()
+            if word not in ("on", "off", "yes", "no", "true", "false"):
+                sys.exit("Usage: g510 discord browse [on|off]")
+            want = word in ("on", "yes", "true")
+        sent = _client("browse", **({"on": want} if want is not None else {}))
+        print(f"  discord browse {'is on' if sent.get('active') else 'is off'}")
+        if want and not sent.get("active"):
+            print("  (nothing let it in? - the log says why: "
+                  "~/Library/Logs/g510.log)")
+        return
+
     # The four that change something in Discord.
     if head == "older":
         limit = int(rest[0]) if rest and str(rest[0]).isdigit() else 30
@@ -1570,7 +1590,8 @@ def cmd_discord(args):
     block = settings.setdefault("notifications", {})
     head = args[0].lower() if args else "show"
     rest = args[1:]
-    if head in ("channels", "history", "older", "open", "say", "reply"):
+    if head in ("channels", "history", "older", "open", "say", "reply",
+                "browse"):
         return _discord_client(head, rest)
     if head in ("on", "off", "enable", "disable"):
         block["enabled"] = head in ("on", "enable")
