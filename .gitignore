@@ -9,3 +9,9 @@ build-venv/
 *.buildinfo
 *.changes
 TASKS.md
+
+# The Bad Apple playback experiment: the video, the audio it was cut
+# from, the encoded `.g5ba` and the converter that reads it. Nothing here
+# belongs in a repository of a keyboard driver.
+badapple*
+*.g5ba
