@@ -773,6 +773,23 @@ def screen_message(canvas, state):
         canvas.text(_fit(canvas, detail, 9), 2, 31, 9)
 
 
+def _list_title(data):
+    """The name of the list `data.channels` belongs to: a server, or the DMs.
+
+    The rows below carry only the channel, so this line at the top is the
+    one place the server can be said out loud - and it has the whole width
+    of the panel to say it in, where a row has not.
+    """
+    wanted = str(data.get("list") or "")
+    for row in data.get("lists") or []:
+        if str(row.get("id") or "") == wanted:
+            return str(row.get("name") or "") or "DISCORD"
+    for row in data.get("lists") or []:
+        if row.get("current"):
+            return str(row.get("name") or "") or "DISCORD"
+    return "DISCORD"
+
+
 def screen_discord(canvas, state):
     """The conversation, as the Vencord plugin last reported it.
 
@@ -816,7 +833,7 @@ def screen_discord(canvas, state):
             canvas.text(lines[1], 2, 36, 9)
         return
 
-    canvas.text("DISCORD", 2, 0, 11)
+    canvas.text(_fit(canvas, _list_title(data), 11), 2, 0, 11)
     canvas.text(corner, LCD_RIGHT - canvas.measure(corner, 11), 1, 11)
     rows = [row for row in (data.get("channels") or [])][:3]
     if not rows:

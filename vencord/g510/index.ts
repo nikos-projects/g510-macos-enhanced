@@ -151,9 +151,13 @@ function channelName(channel: any): string {
             .filter(Boolean);
         return channel.name || people.join(", ") || "DM";
     }
-    const guild = GuildStore.getGuild(channel.guild_id);
+    // No server name on a row. The header already says which server the
+    // list belongs to, and the panel has one line per channel at 156px:
+    // a "Server Name #channel" prefix left nothing but the prefix after
+    // it was trimmed, so every row of a long-named server read the same
+    // and the list looked like it never scrolled.
     const marker = channel.type === 2 || channel.type === 13 ? "" : "#";
-    return `${guild?.name ?? ""} ${marker}${channel.name ?? ""}`.trim();
+    return `${marker}${channel.name ?? ""}`.trim();
 }
 
 function stamp(iso: any): string {

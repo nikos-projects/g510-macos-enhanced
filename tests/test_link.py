@@ -518,6 +518,23 @@ class ScreenDiscordTests(unittest.TestCase):
         self.assertIn(" quiet", drawn)
         self.assertNotIn("*unread", drawn)      # only three rows fit
 
+    def test_the_top_line_says_which_server_these_channels_are_in(self):
+        # The rows carry the channel alone - a "Server #channel" prefix on
+        # each one was trimmed to the same few characters by every row of
+        # a long-named server, so the list looked like it never scrolled.
+        drawn = self.draw(self.pushed(
+            list="9",
+            lists=[{"id": "@me", "name": "DMs", "current": False},
+                   {"id": "9", "name": "Game", "current": True}],
+            channels=[{"id": "1", "name": "here", "current": True}]))
+        self.assertTrue(drawn[0].startswith("Game"), drawn[0])
+        self.assertIn(">here", drawn)
+
+    def test_a_list_nobody_named_says_what_it_is_anyway(self):
+        drawn = self.draw(self.pushed(
+            list="9", channels=[{"id": "1", "name": "here"}]))
+        self.assertEqual(drawn[0], "DISCORD")
+
     def test_it_renders_to_a_whole_frame(self):
         rows = screens.render("discord", {})
         self.assertEqual(len(rows), device.LCD_HEIGHT)
