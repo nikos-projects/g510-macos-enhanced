@@ -78,9 +78,6 @@ follow the Linux `hid-lg-g15` driver and `libg15`.
   game. `g510 discord say|reply` writes in from a shell too. Read from
   inside the client by our own Vencord plugin, so Vesktop (or another
   Vencord build) is what this one asks for
-- **The audio mixer** - hold L4 and the panel shows every application
-  that is making sound, one bar each, with the volume keys moving the
-  system's or Music's
 
 ## 3D printer progress
 
@@ -198,7 +195,6 @@ rather than a tap, so nothing fires on the way to a gesture:
     two presses   L2-L5: freeze the screen where it is
     held down     L2: the menu below, and holding it again shuts it
     held down     L3: the Discord screen with the keys to drive it
-    held down     L4: the audio mixer - what is playing, and how loud
     three         L5: a sticky note
     three         L3: the Discord screen, and the keys to drive it
 
@@ -859,68 +855,6 @@ been since the last push.
 - **Vesktop has to be open.** The plugin runs inside the client, so a
   closed client is `not connected` on the CLI and "waiting for Vesktop"
   on the screen.
-
-## The mixer on the display
-
-Hold L4 and the panel becomes an audio mixer: which applications are
-making the sound, and how loud each of them is, on a display that is
-already under your fingers.
-
-    MIXER                            16:29
-  > SYSTEM                        ██████ 57%
-    Music                         ██ 65%
-    Brave                         ---- --
-
-The bar is the level, read from a **process tap per app**: one tap per
-application, all of them hanging off a single private aggregate device,
-so one callback hands over one buffer per app and the loudest sample of
-each is that app's row. Two apps playing at once are two bars moving,
-which is the question macOS itself never answers anywhere.
-
-The number on the right is the thing the arrow keys *act on*, not the
-level: the system volume on the system row, that app's own volume on
-the two apps that keep one of their own (Music and Spotify), and `--`
-on everything else. macOS has no per-app output volume - that would
-need a virtual device per application - so a number that promised one
-would be a lie, and the bar already says how loud it is.
-
-    left / right        the volume of the row you are on
-    up / down           pick another row (the list scrolls)
-    enter               mute, or unmute, on the system row
-    esc                 hand the keys back
-
-A mixer nobody touches for half a minute gives the keys back by
-itself, for the reason the menu closes itself: an idle panel must not
-go on holding arrows away from the game underneath it. A note, the
-Discord browser or the menu takes the panel from it outright, and a
-notification waits rather than covering the bars - the sound still
-rings, only the sight of it holds off, and the log says
-`banner held back - the mixer has the keys`.
-
-    g510 mixer               bring it up (what holding L4 does)
-    g510 mixer on            the same thing
-    g510 mixer off           let go of it
-
-### What it does not do
-
-- **Nothing is tapped until it has played something.** CoreAudio makes
-  an application's object the first time it makes a sound, so there is
-  nothing to tap before that. The list is looked for again every couple
-  of seconds while the panel is up, which is how an app that starts
-  playing turns up on it - and why the panel opens with "listening..."
-  for a moment.
-- **Only regular applications.** A helper process holding an audio
-  object is not something anybody would recognise on a panel.
-- **No per-app volume but Music's, Spotify's and VLC's**, and those three
-  are asked with AppleScript rather than a property, because that is the
-  only way they will say. Everything else - browsers, games, Discord -
-  is drawn `--`, and left/right honestly does nothing there. Making a
-  slider for those would mean a *virtual audio device* with every app
-  routed through it, which is a driver installed into
-  `/Library/Audio/Plug-Ins/HAL` rather than a script.
-- **The bars are peaks, not averages.** What each app did in the last
-  tenth of a second, falling back towards zero when it stops rather
-  than sitting on its last loud reading.
 
 ## Installing
 

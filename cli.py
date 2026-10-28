@@ -66,7 +66,6 @@ USAGE = """g510 - control a Logitech G510 keyboard on macOS
   g510 menu [open|close]        the settings menu on the panel
   g510 menu key <name>          press a key in it: up down left right enter esc
   g510 note [text|clear]        a sticky note on the panel (3x press of L5)
-  g510 mixer [on|off]           what is playing, and how loud (hold of L4)
 
   g510 autoscreen               what the rules see, and what they would pick
   g510 autoscreen on|off        switch screens by activity, or stop doing it
@@ -804,36 +803,6 @@ def cmd_note(args):
     if not reply.get("ok"):
         sys.exit(reply.get("error", "agent refused"))
     print(f"note pinned: {reply.get('note')}")
-
-
-def cmd_mixer(args):
-    """Show the audio mixer, or bring it up and let it go.
-
-    The same panel holding L4 brings up: what is playing and how loud
-    each of them is. Nothing here reads the sound - the taps are the
-    agent's, opened while the panel is up - so this only asks it to
-    open or close the thing, which is why every one of these needs the
-    agent to be running.
-    """
-    if not args:
-        action = "show"
-    elif args[0].lower() in ("on", "open", "show", "up"):
-        action = "on"
-    elif args[0].lower() in ("off", "close", "stop", "down"):
-        action = "off"
-    else:
-        sys.exit("Usage: g510 mixer [on|off]")
-    reply = agent_reply("mixer", action=action)
-    if reply is None:
-        sys.exit("No agent running - the mixer is a thing on the panel, "
-                 "so it lives in the agent. Try: g510 start")
-    if not reply.get("ok"):
-        sys.exit(reply.get("error", "agent refused"))
-    if action == "off" or not reply.get("active"):
-        print("mixer off")
-        return
-    print("mixer up - arrows pick, left right volume, enter mutes "
-          "system, esc lets go")
 
 
 SETTING_KEYS = ("idle_seconds", "hold_seconds", "manual_seconds",
@@ -2137,7 +2106,7 @@ COMMANDS = {
     "trigger": cmd_trigger, "triggers": cmd_trigger,
     "timer": cmd_timer, "timers": cmd_timer,
     "discord": cmd_discord, "chat": cmd_discord, "notifications": cmd_discord,
-    "menu": cmd_menu, "note": cmd_note, "mixer": cmd_mixer,
+    "menu": cmd_menu, "note": cmd_note,
 }
 
 
