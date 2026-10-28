@@ -911,10 +911,13 @@ rings, only the sight of it holds off, and the log says
   for a moment.
 - **Only regular applications.** A helper process holding an audio
   object is not something anybody would recognise on a panel.
-- **No per-app volume but Music's and Spotify's**, and those two are
-  asked with AppleScript rather than a property, because that is the
-  only way they will say. An app that will not answer is drawn with
-  `--` rather than with a key that does nothing.
+- **No per-app volume but Music's, Spotify's and VLC's**, and those three
+  are asked with AppleScript rather than a property, because that is the
+  only way they will say. Everything else - browsers, games, Discord -
+  is drawn `--`, and left/right honestly does nothing there. Making a
+  slider for those would mean a *virtual audio device* with every app
+  routed through it, which is a driver installed into
+  `/Library/Audio/Plug-Ins/HAL` rather than a script.
 - **The bars are peaks, not averages.** What each app did in the last
   tenth of a second, falling back towards zero when it stops rather
   than sitting on its last loud reading.

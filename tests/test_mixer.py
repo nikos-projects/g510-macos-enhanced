@@ -615,5 +615,39 @@ class AgentTests(unittest.TestCase):
         self.assertIsNone(self.agent.mixer_levels)
 
 
+class AudioTests(unittest.TestCase):
+    """The AppleScript half: the three apps that keep a volume of their
+    own, and the panel's percent versus each one's own scale."""
+
+    def setUp(self):
+        audio._volume_cache.clear()
+
+    def answer(self, text):
+        return mock.patch.object(audio, "_ask_osascript", return_value=text)
+
+    def test_music_speaks_the_same_numbers_the_panel_does(self):
+        with self.answer(65) as asked:
+            self.assertEqual(audio.app_volume("com.apple.Music"), 65)
+        asked.assert_called_once()
+
+    def test_vlc_counts_to_256_and_the_panel_still_says_percent(self):
+        with self.answer(128):
+            self.assertEqual(audio.app_volume("org.videolan.vlc"), 50)
+        with self.answer(1) as asked:
+            self.assertEqual(audio.set_app_volume("org.videolan.vlc", 50), 50)
+        self.assertIn("set sound volume to 128", asked.call_args.args[0])
+
+    def test_an_app_that_keeps_no_volume_is_not_asked_at_all(self):
+        with self.answer(50) as asked:
+            self.assertIsNone(audio.app_volume("com.brave.Browser"))
+        asked.assert_not_called()
+
+    def test_the_answer_is_remembered_rather_than_asked_for_twice(self):
+        with self.answer(40) as asked:
+            audio.app_volume("com.spotify.client")
+            audio.app_volume("com.spotify.client")
+        asked.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

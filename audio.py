@@ -47,8 +47,14 @@ DEFAULT_OUTPUT = 0x644f7574        # 'dOut', on the system object
 SYSTEM_OBJECT = 1                  # the id every hardware property hangs off
 
 MAX_TAPS = 16                      # as many apps as one aggregate may carry
-VOLUME_APPS = {"com.apple.Music": "Music",
-               "com.spotify.client": "Spotify"}
+# Apps that keep a volume of their own and will say what it is over
+# AppleScript - the only per-app volume macOS has, because it is the app's
+# own rather than the system's. The number is how far that app's slider
+# goes: VLC counts to 256, the others to 100, and the panel only ever
+# speaks percent.
+VOLUME_APPS = {"com.apple.Music": ("Music", 100),
+               "com.spotify.client": ("Spotify", 100),
+               "org.videolan.vlc": ("VLC", 256)}
 
 
 class AudioBuffer(ctypes.Structure):
@@ -324,16 +330,17 @@ def app_volume(bundle):
     is re-read every time the app list is rebuilt and shelling out to
     `osascript` twice a second would be its own kind of stall.
     """
-    name = VOLUME_APPS.get(bundle)
-    if not name:
+    entry = VOLUME_APPS.get(bundle)
+    if not entry:
         return None
+    name, top = entry
     with _volume_lock:
         if bundle in _volume_cache:
             return _volume_cache[bundle]
-    value = _ask_osascript(
-        f'tell application "{name}" to get sound volume')
-    if value is None:
+    raw = _ask_osascript(f'tell application "{name}" to get sound volume')
+    if raw is None:
         return None
+    value = _to_percent(raw, top)
     with _volume_lock:
         _volume_cache[bundle] = value
     return value
@@ -341,17 +348,30 @@ def app_volume(bundle):
 
 def set_app_volume(bundle, value):
     """Set an app's own volume, and say what it became - or None."""
-    name = VOLUME_APPS.get(bundle)
-    if not name:
+    entry = VOLUME_APPS.get(bundle)
+    if not entry:
         return None
+    name, top = entry
     value = max(0, min(100, int(value)))
+    raw = _from_percent(value, top)
     if _ask_osascript(
-            f'tell application "{name}" to set sound volume to {value}') \
+            f'tell application "{name}" to set sound volume to {raw}') \
             is None:
         return None
     with _volume_lock:
         _volume_cache[bundle] = value
     return value
+
+
+def _to_percent(raw, top):
+    """An app's own scale as the panel's 0..100, rounded the way a slider
+    would land rather than the way the arithmetic goes."""
+    return max(0, min(100, int(round(float(raw) * 100.0 / top))))
+
+
+def _from_percent(value, top):
+    """The panel's 0..100 as this app's own scale."""
+    return max(0, min(int(top), int(round(float(value) * top / 100.0))))
 
 
 def change_app_volume(bundle, delta):
