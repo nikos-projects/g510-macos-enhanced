@@ -468,6 +468,10 @@ def build():
             _sub("Backlight", [
                 _num("brightness", "Brightness", step=5, lo=0, hi=100),
                 _choice("backlight", "Colour", _colors()),
+                _bool("beat/enabled", "Beat pulse"),
+                _num("beat/amount", "Dip %", step=5, lo=0, hi=100),
+                _num("beat/decay", "Back in s", step=0.05, lo=0.05, hi=5),
+                _num("beat/sensitivity", "Sens", step=5, lo=0, hi=100),
                 _sub("Power-on colour",
                      [_act(name, "poweron", name) for name in _colors()]),
                 _sub("M-keys",

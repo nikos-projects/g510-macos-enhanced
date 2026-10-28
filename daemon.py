@@ -16,6 +16,7 @@ import time
 import actions
 import alerts
 import autoscreen
+import beat
 import browse
 import config
 import device
@@ -201,6 +202,17 @@ class Daemon:
         # thing happening on the screen, not a setting, so the config file
         # never learns about it either.
         self.browse = browse.Browser()
+        # The backlight dipping on the beat of the music (P5). The tap is
+        # runtime state - opened and closed by `beat.enabled` - and so is
+        # the pulse it triggers: the config says whether to dip and how
+        # far, never which beat is happening now.
+        self.beat = None                # the listener, once one is wanted
+        self.beat_detector = beat.Detector()
+        self.pulse_start = 0.0
+        self.pulse_decay = 0.0
+        self.pulse_amount = 0.0
+        self.pulse_end = 0.0            # when the dip has climbed back
+        self.pulse_at = 0.0             # last write, to pace the climb
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -285,6 +297,7 @@ class Daemon:
         self.show_bank_led()
         self.sync_watcher()
         self.sync_link()
+        self.sync_beat()
 
     def sync_watcher(self):
         """The readers follow `notifications.enabled`, and the config.
@@ -334,6 +347,35 @@ class Daemon:
         if self.link is not None:
             self.link.stop()
         self.link = link.Link(block, log=log).start()
+
+    def sync_beat(self):
+        """The beat listener follows `beat.enabled`.
+
+        A tap is a system-wide audio tap plus an aggregate device, so it
+        is opened here, on a config reload, and never in the poll loop -
+        and a tap that will not open leaves the switch where it is,
+        because `refresh_beat` does nothing without a listener and the
+        reason is already in the log. Restarting on every reload would
+        also throw away the levels the detector has already averaged.
+        """
+        block = self.config.get("beat") or {}
+        wanted = bool(block.get("enabled", False))
+        if wanted and self.beat is None:
+            listener = beat.Listener(log=log)
+            if listener.start():
+                self.beat = listener
+                self.beat_detector = beat.Detector(
+                    beat.sensitivity_of(block))
+        elif not wanted and self.beat is not None:
+            listener, self.beat = self.beat, None
+            listener.stop()
+            log("beat tap off")
+        # The sensitivity is pushed on every reload, tap open or not, so
+        # a spinner on the panel takes effect at once. It is applied to
+        # the running detector rather than by replacing it: the averages
+        # are what the last few seconds of music actually sounded like,
+        # and starting them over would make the next hit a miss.
+        self.beat_detector.set_sensitivity(beat.sensitivity_of(block))
 
     def run_command(self, command, payload):
         if command == "timer":
@@ -1838,8 +1880,83 @@ class Daemon:
         if name == self.current_app:
             return
         self.current_app = name
+        if self.pulse_end > now:
+            # A beat has the colour until its pulse has climbed back,
+            # and the pulse puts `active_color()` back itself when it
+            # runs out - so the new app's colour arrives with it rather
+            # than as one full-bright frame through the middle of a dip.
+            return
         with self.lock:
             self.keyboard.set_backlight(self.active_color())
+
+    def refresh_beat(self, now):
+        """Dip the backlight on each beat of the music, and climb back.
+
+        This is the only thing that writes the colour while a pulse is
+        running, and it writes it thirty times a second rather than on
+        every tick of the loop - see `beat.WRITE_INTERVAL`. The pulse
+        owns the colour from the beat until `pulse_end`, which is what
+        the rest of the agent checks before touching the backlight.
+        """
+        block = self.config.get("beat") or {}
+        if not block.get("enabled", False):
+            if self.beat is not None:
+                listener, self.beat = self.beat, None
+                listener.stop()
+                log("beat tap off")
+            if self.pulse_end > now:
+                # Switched off mid-dip: the colour it was dipping is the
+                # colour to go back to, and nothing else would put it
+                # there.
+                self.pulse_end = 0.0
+                self.write_backlight(self.active_color())
+            return
+        if self.beat is None:
+            return                              # the tap would not open
+        fresh, level = self.beat.poll(now)
+        if fresh and self.beat_detector.push(level, now):
+            amount, decay = beat.pulse_settings(block)
+            self.pulse_amount = amount
+            self.pulse_decay = decay
+            self.pulse_start = now
+            self.pulse_end = now + decay
+            self.pulse_at = now
+            self.write_backlight(self.beat_color(now))
+            return
+        if self.pulse_end <= now:
+            if self.pulse_end:                  # the tail ran out
+                self.pulse_end = 0.0
+                self.write_backlight(self.active_color())
+            return
+        if now - self.pulse_at < beat.WRITE_INTERVAL:
+            return
+        self.pulse_at = now
+        self.write_backlight(self.beat_color(now))
+
+    def beat_color(self, now):
+        """The colour at `now` inside a pulse.
+
+        Straight down to `amount`% the instant the beat lands, then a
+        straight line back to full over `decay` seconds - a dip rather
+        than a flash, because the panel is showing it to somebody who
+        is listening to the music rather than watching for it.
+        """
+        span = self.pulse_decay or 0.001
+        done = (now - self.pulse_start) / span
+        done = 0.0 if done < 0.0 else (1.0 if done > 1.0 else done)
+        scale = self.pulse_amount + (100.0 - self.pulse_amount) * done
+        return config.apply_brightness(self.active_color(), int(round(scale)))
+
+    def write_backlight(self, rgb):
+        """One backlight write, under the lock every device touch takes.
+
+        The keyboard can be gone by the time a socket thread or the poll
+        loop gets here - it lives on a dock - and a missing device is a
+        normal state for this agent, not an error to stop for.
+        """
+        with self.lock:
+            if self.keyboard is not None:
+                self.keyboard.set_backlight(rgb)
 
     def run(self):
         signal.signal(signal.SIGTERM, self.stop)
@@ -1848,6 +1965,7 @@ class Daemon:
         self.server.start()
         self.sync_watcher()
         self.sync_link()
+        self.sync_beat()
         log(f"control socket at {ipc.SOCKET_PATH}")
         while self.running:
             if self.keyboard is None:
@@ -1862,6 +1980,7 @@ class Daemon:
                 self.refresh_alerts(now)
                 self.refresh_triggers(now)
                 self.refresh_lcd(now)
+                self.refresh_beat(now)
                 self.refresh_app_color(now)
                 self.refresh_indicators(now)
             except (OSError, ValueError) as exc:
@@ -1876,6 +1995,12 @@ class Daemon:
         if self.keytap is not None:
             try:
                 self.keytap.stop()
+            except Exception:
+                pass
+        listener, self.beat = self.beat, None
+        if listener is not None:
+            try:
+                listener.stop()       # and lets the audio tap go too
             except Exception:
                 pass
         watcher, self.watcher = self.watcher, None

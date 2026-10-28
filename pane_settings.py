@@ -52,6 +52,12 @@ LIMITS = {
     "hold_seconds": (0, 60), "manual_seconds": (0, 86400),
     "refresh_seconds": (0.1, 600), "stale_after_seconds": (0, 86400),
     "port": (1, 65535),
+    # The beat dip: how far down as a percentage, and how long it takes
+    # to climb back - the same two ranges the CLI refuses to go outside.
+    "amount": (0, 100), "decay": (0.05, 5),
+    # How eager the detector is: the one number on the row that is not
+    # about the shape of the dip but about what counts as a hit.
+    "sensitivity": (0, 100),
 }
 
 # The kinds a FIELDS row can name. `_SCALAR` is the ones that write a config
@@ -184,6 +190,23 @@ FIELDS = {
         kind="act", card="backlight", top=10, x=146, w=170,
         label="Power on with", labels="poweron",
         options=lambda: ("",) + tuple(sorted(config.NAMED_COLORS))),
+    # The beat dip: the switch first, then the two numbers the pulse is
+    # drawn from. They sit under the app-colour list, which is where the
+    # card has to grow to reach them.
+    "beat/enabled": dict(
+        kind="bool", card="backlight", top=214, x=16, w=420,
+        title="Dip the backlight to the beat of the music"),
+    "beat/amount": dict(
+        kind="num", card="backlight", top=242, x=76, w=60,
+        label="Dip to %"),
+    "beat/decay": dict(
+        kind="num", card="backlight", top=242, x=230, w=60,
+        label="Back in (s)", lx=150),
+    # Third on the same row: the other two say what the dip looks like,
+    # this one says how easily a beat is counted as one.
+    "beat/sensitivity": dict(
+        kind="num", card="backlight", top=242, x=384, w=60,
+        label="Sens", lx=308),
 
     # -- GAUGES and the two other lists
     "gauges": dict(kind="rows", card="gauges"),

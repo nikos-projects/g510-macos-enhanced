@@ -15,6 +15,14 @@ DEFAULTS = {
     "backlight": "#ffffff",
     "brightness": 100,
     "restore_backlight_on_start": True,
+    # The backlight dipping to the beat of the music - see beat.py. Off
+    # by default: it opens a system-wide audio tap, which is a thing to
+    # opt into rather than to find already running. `amount` is how far
+    # down it dips as a percentage, `decay` how long it takes to climb
+    # back to full, and `sensitivity` how eager the detector is - 50 is
+    # the middle of its range, 100 catches everything.
+    "beat": {"enabled": False, "amount": 60, "decay": 0.35,
+             "sensitivity": 50},
     "lcd": {
         "enabled": True,
         "screen": "status",

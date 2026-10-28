@@ -161,7 +161,7 @@ class G510Window(NSObject):
             (310, "TRIGGERS", pane_settings.fill_trigger_rules),
             (178, "CHAT MESSAGES", pane_settings.fill_chat),
             (234, "PANEL & INDICATORS", pane_settings.fill_panel),
-            (218, "MORE BACKLIGHT", pane_settings.fill_backlight),
+            (272, "MORE BACKLIGHT", pane_settings.fill_backlight),
             (148, "GAUGES", pane_settings.fill_gauges),
             (132, "3D PRINTER", pane_settings.fill_printer),
         ])

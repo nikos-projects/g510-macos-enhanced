@@ -8,6 +8,7 @@ import time
 import actions
 import alerts
 import autoscreen
+import beat
 import config
 import control
 import device
@@ -51,6 +52,7 @@ USAGE = """g510 - control a Logitech G510 keyboard on macOS
   g510 info                     device, interfaces, current state
   g510 color [colour]           show or set the backlight (#rrggbb or a name)
   g510 brightness [0-100]       show or set backlight brightness
+  g510 beat [on|off] [amount N] [decay S] [sensitivity N]   pulse the backlight on the beat
   g510 poweron <colour>         colour the keyboard powers on with
   g510 mkeys [m1 m2 m3 mr]      light M-key LEDs (no args clears them)
   g510 watch [--raw]            print G-key presses live
@@ -365,6 +367,86 @@ def cmd_brightness(args):
     reload_agent()
     print(f"brightness -> {value}%  "
           f"({config.format_color(config.effective_color(settings))})")
+
+
+def cmd_beat(args):
+    """Show or set the backlight's beat pulse.
+
+    Everything it changes lives in the `beat` block of the config, so the
+    agent picks it up through the same reload every other setting uses -
+    and the audio tap that block opens is opened by that reload. Nothing
+    here touches the keyboard, which the agent is holding anyway.
+    """
+    settings = config.load()
+    block = settings.setdefault("beat", {})
+    if args and args[0].lower() not in ("status", "show"):
+        _beat_apply(block, args)
+        save_config(settings)
+        reload_agent()
+    _beat_print(block)
+
+
+def _beat_apply(block, args):
+    """What `g510 beat ...` was asked for, in any order.
+
+    `beat on amount 40` and `beat amount 40 on` are the same command, so
+    the pairs are walked rather than matched - a subcommand list would
+    make the obvious thing to type an error.
+    """
+    index = 0
+    while index < len(args):
+        head = args[index].lower()
+        if head in ("on", "enable", "enabled"):
+            block["enabled"] = True
+            index += 1
+            continue
+        if head in ("off", "disable", "disabled"):
+            block["enabled"] = False
+            index += 1
+            continue
+        if index + 1 >= len(args):
+            sys.exit(f"beat {args[index]!r} needs a value")
+        raw = args[index + 1]
+        if head in ("amount", "dip", "level"):
+            try:
+                value = int(str(raw).rstrip("%"))
+            except ValueError:
+                sys.exit("Beat dip must be a number from 0 to 100, "
+                         f"not {raw!r}")
+            if not 0 <= value <= 100:
+                sys.exit("Beat dip must be between 0 and 100")
+            block["amount"] = value
+        elif head in ("decay", "back", "seconds"):
+            try:
+                value = float(raw)
+            except ValueError:
+                sys.exit("Beat climb-back must be a number of seconds, "
+                         f"not {raw!r}")
+            if not 0.05 <= value <= 5:
+                sys.exit("Beat climb-back must be between 0.05 and 5 seconds")
+            block["decay"] = value
+        elif head in ("sensitivity", "sens", "sense"):
+            try:
+                value = int(str(raw).rstrip("%"))
+            except ValueError:
+                sys.exit("Beat sensitivity must be a number from 0 to 100, "
+                         f"not {raw!r}")
+            if not 0 <= value <= 100:
+                sys.exit("Beat sensitivity must be between 0 and 100")
+            block["sensitivity"] = value
+        else:
+            sys.exit("Usage: g510 beat [on|off] [amount N] [decay S] "
+                     "[sensitivity N]")
+        index += 2
+
+
+def _beat_print(block):
+    """The whole setting on one line, clamped the way the agent clamps it."""
+    amount, decay = beat.pulse_settings(block)
+    sensitivity = beat.sensitivity_of(block)
+    state = "on" if block.get("enabled") else "off"
+    print(f"beat {state}, dip to {amount:g}%, back in {decay:g}s, "
+          f"sens {sensitivity:g}")
 
 
 def cmd_record(args):
@@ -1967,7 +2049,8 @@ COMMANDS = {
     "poweron": cmd_poweron, "mkeys": cmd_mkeys, "watch": cmd_watch,
     "lcd": cmd_lcd, "bindings": cmd_bindings, "bind": cmd_bind,
     "config": cmd_config, "permissions": cmd_permissions,
-    "brightness": cmd_brightness, "record": cmd_record, "macros": cmd_macros,
+    "brightness": cmd_brightness, "beat": cmd_beat,
+    "record": cmd_record, "macros": cmd_macros,
     "profile": cmd_profile, "profiles": cmd_profile, "next": cmd_next,
     "bank": cmd_bank, "switch": cmd_switch,
     "printer": cmd_printer, "claude": cmd_claude, "install": cmd_install,

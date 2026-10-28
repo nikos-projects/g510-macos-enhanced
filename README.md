@@ -33,6 +33,10 @@ follow the Linux `hid-lg-g15` driver and `libg15`.
 ## What works
 
 - RGB backlight, with brightness, a power-on colour, and per-app colours
+- The same backlight dipping to the beat of whatever is playing, and
+  climbing back over a third of a second - off until `g510 beat on`, since
+  it listens to the Mac's audio to do it. How hard it takes to be counted
+  as a hit is a knob of its own, 0 to 100
 - M1/M2/M3/MR LEDs
 - All 18 G-keys, bound to apps, shell commands, key chords, typed text or
   recorded macros, with per-app profiles layered on top
