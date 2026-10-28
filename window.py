@@ -153,6 +153,7 @@ class G510Window(NSObject):
         self.panes["Agent"] = build_pane(self, [
             (92, "BACKGROUND AGENT", pane_agent.fill_agent),
             (76, "CONFIGURATION FILE", pane_agent.fill_configfile),
+            (112, "APP API", pane_settings.fill_api),
         ])
         self.panes["Settings"] = build_pane(self, [
             (230, "AUTO SWITCH", pane_settings.fill_auto),

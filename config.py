@@ -23,6 +23,11 @@ DEFAULTS = {
     # the middle of its range, 100 catches everything.
     "beat": {"enabled": False, "amount": 60, "decay": 0.35,
              "sensitivity": 50},
+    # The API any program on this Mac can hook into - see api.py. On by
+    # default because it is bound to 127.0.0.1 and costs nothing until
+    # something asks it a question, and because an interface nobody can
+    # find is not one anybody will write against.
+    "api": {"enabled": True, "port": 7420},
     "lcd": {
         "enabled": True,
         "screen": "status",

@@ -15,9 +15,11 @@ import time
 
 import actions
 import alerts
+import api
 import autoscreen
 import beat
 import browse
+import extern
 import config
 import device
 import ipc
@@ -213,6 +215,11 @@ class Daemon:
         self.pulse_amount = 0.0
         self.pulse_end = 0.0            # when the dip has climbed back
         self.pulse_at = 0.0             # last write, to pace the climb
+        # The API any program can hook into (P8): a server on 127.0.0.1
+        # over the same dispatcher the control socket uses, so the two
+        # can never disagree about what a command means. Started and
+        # stopped by the config, exactly like the Discord link.
+        self.api = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -298,6 +305,7 @@ class Daemon:
         self.sync_watcher()
         self.sync_link()
         self.sync_beat()
+        self.sync_api()
 
     def sync_watcher(self):
         """The readers follow `notifications.enabled`, and the config.
@@ -347,6 +355,92 @@ class Daemon:
         if self.link is not None:
             self.link.stop()
         self.link = link.Link(block, log=log).start()
+
+    def sync_api(self):
+        """The public API follows `api.enabled`, and its port.
+
+        The same shape as `sync_link`: a port that changed restarts it,
+        everything else is just repointing the block. A port that is
+        already taken is a state rather than a reason to stop the agent
+        - `Api.start` records it and the keyboard carries on being a
+        keyboard.
+        """
+        block = self.config.get("api") or {}
+        if not block.get("enabled", True):
+            if self.api is not None:
+                self.api.stop()
+                self.api = None
+            return
+        try:
+            port = int(block.get("port", api.DEFAULT_PORT) or
+                       api.DEFAULT_PORT)
+        except (TypeError, ValueError):
+            port = api.DEFAULT_PORT
+        if self.api is not None and self.api.port == port:
+            self.api.block = block
+            return
+        if self.api is not None:
+            self.api.stop()
+        self.api = api.Api(self, block, log=log).start()
+
+    def publish(self, kind, data=None):
+        """Tell everyone watching the API. Nothing may ever raise here.
+
+        This is called from the poll loop, from key handling and from
+        the socket threads - all places holding, or about to hold, the
+        only handle to the keyboard. A subscriber with a broken pipe is
+        that subscriber's problem and must never become the agent's.
+        """
+        hub = self.api.hub if self.api is not None else None
+        if hub is None:
+            return
+        try:
+            hub.publish(kind, data)
+        except Exception:
+            pass
+
+    def sweep_screens(self, now):
+        """Take down outside screens whose program has stopped pushing.
+
+        Run from the poll loop rather than from a timer thread because
+        it is the loop that already owns the display: a screen whose
+        program has gone is only worth catching on the way to the next
+        redraw, and `extern.TTL` is thirty seconds - the throttling
+        here is about not calling `time.time()` into a dict walk a
+        hundred times a second, not about the sweep being expensive.
+        """
+        if now - getattr(self, "_swept", 0.0) < extern.TTL / 3.0:
+            return
+        self._swept = now
+        for name in extern.sweep(now):
+            log(f"screen {name!r} went away - its program stopped pushing")
+            self.leave_screen(name)
+
+    def leave_screen(self, name):
+        """The panel is showing a screen that has just gone away.
+
+        An outside program's screen is only there while the program is
+        (see `extern.py`), so this is the moment it stops being. The
+        display moves on rather than sitting on a fallback the user did
+        not ask for, and the config is corrected too - otherwise the
+        next reload would put it straight back.
+        """
+        lcd = self.config.get("lcd") or {}
+        if lcd.get("screen") != name:
+            return
+        cycle = [n for n in lcd.get("cycle") or [] if n in screens.SCREENS
+                 and n != name]
+        target = cycle[0] if cycle else "status"
+
+        def apply(settings):
+            entry = settings.setdefault("lcd", {})
+            if entry.get("screen") == name:
+                entry["screen"] = target
+
+        self.mutate(apply)
+        self.last_lcd = 0.0
+        log(f"LCD -> {target} (a screen went away)")
+        self.publish("screen", {"screen": target})
 
     def sync_beat(self):
         """The beat listener follows `beat.enabled`.
@@ -550,6 +644,13 @@ class Daemon:
                     events.put_nowait(message)
                 except queue.Full:
                     pass
+        # The API's subscribers get the same events from the same places,
+        # so there is one list of "things that happened" rather than two
+        # that drift. Key presses and releases are what `broadcast` is
+        # called with today; `publish` below is for the wider set - the
+        # screen moving, an app coming forward, a timer finishing - that
+        # has no business being on the raw key stream.
+        self.publish("key", message)
 
     # -- work --------------------------------------------------------------
 
@@ -814,6 +915,7 @@ class Daemon:
         self.mutate(apply)
         self.last_lcd = 0.0
         log(f"LCD -> {current}")
+        self.publish("screen", {"screen": current})
         return current
 
     def fire_mode_key(self, name):
@@ -1056,6 +1158,10 @@ class Daemon:
                              block.get("sound"))
             log(f"timer {timers.left(item.get('seconds') or 0)} is up"
                 + (f" ({item.get('label')})" if item.get("label") else ""))
+            # Published where it happens rather than where it was set:
+            # "a countdown finished" is the thing worth reacting to, and
+            # it has no key attached to it.
+            self.publish("timer", self._timer_data("done", item))
         if self.watcher is None:
             return
         note = self.config.get("notifications") or {}
@@ -1880,6 +1986,10 @@ class Daemon:
         if name == self.current_app:
             return
         self.current_app = name
+        # Told rather than polled: an app coming forward is the single
+        # most useful thing for another program to react to, since it is
+        # what this whole agent's colour and profile logic keys off.
+        self.publish("app", {"app": name})
         if self.pulse_end > now:
             # A beat has the colour until its pulse has climbed back,
             # and the pulse puts `active_color()` back itself when it
@@ -1922,6 +2032,10 @@ class Daemon:
             self.pulse_end = now + decay
             self.pulse_at = now
             self.write_backlight(self.beat_color(now))
+            # A beat is the one event here at up to five a second, so it
+            # carries no level and no colour - a program reacting to it
+            # wants the fact, and the backlog is its own business.
+            self.publish("beat", {"amount": amount, "decay": decay})
             return
         if self.pulse_end <= now:
             if self.pulse_end:                  # the tail ran out
@@ -1966,6 +2080,7 @@ class Daemon:
         self.sync_watcher()
         self.sync_link()
         self.sync_beat()
+        self.sync_api()
         log(f"control socket at {ipc.SOCKET_PATH}")
         while self.running:
             if self.keyboard is None:
@@ -1983,6 +2098,7 @@ class Daemon:
                 self.refresh_beat(now)
                 self.refresh_app_color(now)
                 self.refresh_indicators(now)
+                self.sweep_screens(now)
             except (OSError, ValueError) as exc:
                 self.drop(exc)
                 time.sleep(RECONNECT_DELAY)
@@ -2015,6 +2131,19 @@ class Daemon:
                 endpoint.stop()         # and lets go of the local port
             except Exception:
                 pass
+        public, self.api = self.api, None
+        if public is not None:
+            try:
+                public.stop()           # and lets go of the API port
+            except Exception:
+                pass
+        # Outside screens belong to a program that was talking to *this*
+        # agent, so they go with it - leaving them in `screens.SCREENS`
+        # would put dead names in the cycle for whoever starts next.
+        try:
+            extern.reset()
+        except Exception:
+            pass
         self.server.stop()
         if self.leds is not None:
             try:

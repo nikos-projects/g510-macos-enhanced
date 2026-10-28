@@ -33,6 +33,11 @@ follow the Linux `hid-lg-g15` driver and `libg15`.
 ## What works
 
 - RGB backlight, with brightness, a power-on colour, and per-app colours
+- **An API other programs can hook into** - `http://127.0.0.1:7420/v1`,
+  over plain HTTP: read every setting, change any of them, send the
+  keyboard a command, subscribe to what it is doing as it happens, and
+  put screens of your own on the LCD for as long as your program is
+  running. `curl http://127.0.0.1:7420/v1` says what there is
 - The same backlight dipping to the beat of whatever is playing, and
   climbing back over a third of a second - off until `g510 beat on`, since
   it listens to the Mac's audio to do it. How hard it takes to be counted

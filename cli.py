@@ -7,6 +7,7 @@ import time
 
 import actions
 import alerts
+import api
 import autoscreen
 import beat
 import config
@@ -53,6 +54,7 @@ USAGE = """g510 - control a Logitech G510 keyboard on macOS
   g510 color [colour]           show or set the backlight (#rrggbb or a name)
   g510 brightness [0-100]       show or set backlight brightness
   g510 beat [on|off] [amount N] [decay S] [sensitivity N]   pulse the backlight on the beat
+  g510 api [on|off] [port N]        the API other programs hook into
   g510 poweron <colour>         colour the keyboard powers on with
   g510 mkeys [m1 m2 m3 mr]      light M-key LEDs (no args clears them)
   g510 watch [--raw]            print G-key presses live
@@ -2039,6 +2041,49 @@ def cmd_run(_args):
     daemon.main()
 
 
+def cmd_api(args):
+    """Show or set the API other programs hook into.
+
+    Everything it changes lives in the `api` block, so the agent picks
+    it up through the same reload every other setting uses - and the
+    port is reopened by that reload, exactly like the Discord link's.
+    Nothing here touches the keyboard, which the agent is holding.
+    """
+    settings = config.load()
+    block = settings.setdefault("api", {})
+    if args:
+        head = args[0].lower()
+        if head in ("on", "enable", "enabled"):
+            block["enabled"] = True
+        elif head in ("off", "disable", "disabled"):
+            block["enabled"] = False
+        elif head in ("port", "listen"):
+            if len(args) < 2:
+                sys.exit("Usage: g510 api port <1-65535>")
+            try:
+                port = int(args[1])
+            except ValueError:
+                sys.exit(f"API port must be a number, not {args[1]!r}")
+            if not 1 <= port <= 65535:
+                sys.exit("API port must be between 1 and 65535")
+            block["port"] = port
+        else:
+            sys.exit("Usage: g510 api [on|off] [port N]")
+        save_config(settings)
+        reload_agent()
+    enabled = bool(block.get("enabled", True))
+    try:
+        port = int(block.get("port", api.DEFAULT_PORT) or api.DEFAULT_PORT)
+    except (TypeError, ValueError):
+        port = api.DEFAULT_PORT
+    state = "on" if enabled else "off"
+    print(f"api {state}, http://127.0.0.1:{port}/v1"
+          if enabled else f"api {state}")
+    if enabled:
+        print("  anything on this Mac can drive the keyboard and read "
+              "your config")
+
+
 def cmd_gui(_args):
     import gui
     gui.main()
@@ -2049,7 +2094,7 @@ COMMANDS = {
     "poweron": cmd_poweron, "mkeys": cmd_mkeys, "watch": cmd_watch,
     "lcd": cmd_lcd, "bindings": cmd_bindings, "bind": cmd_bind,
     "config": cmd_config, "permissions": cmd_permissions,
-    "brightness": cmd_brightness, "beat": cmd_beat,
+    "brightness": cmd_brightness, "beat": cmd_beat, "api": cmd_api,
     "record": cmd_record, "macros": cmd_macros,
     "profile": cmd_profile, "profiles": cmd_profile, "next": cmd_next,
     "bank": cmd_bank, "switch": cmd_switch,

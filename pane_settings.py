@@ -185,6 +185,16 @@ FIELDS = {
         kind="screens", card="panel", top=204, x=116, w=348, label="Cycle",
         placeholder="status, clock, media - what the cycle walks"),
 
+    # -- APP API
+    # Not a setting so much as an offer: this is the switch that puts
+    # the keyboard within reach of every other program on the Mac, so
+    # it is worded as what it does rather than as a port number.
+    "api/enabled": dict(
+        kind="bool", card="api", top=10, x=16, w=420,
+        title="Let other programs drive the keyboard (http://127.0.0.1)"),
+    "api/port": dict(
+        kind="num", card="api", top=42, x=116, w=70, label="Port"),
+
     # -- MORE BACKLIGHT
     "poweron": dict(
         kind="act", card="backlight", top=10, x=146, w=170,
@@ -406,6 +416,14 @@ def fill_chat(win, content, height):
 def fill_panel(win, content, height):
     fill_fields(win, content, height, "panel")
     caption(content, height, 141, 276, 188, "hold L2 to open the menu")
+
+
+def fill_api(win, content, height):
+    fill_fields(win, content, height, "api")
+    caption(content, height, 74, 16, 448,
+            "Anything on this Mac can read your settings, drive the "
+            "keyboard and add screens of its own - see http://127.0.0.1:"
+            f"{win.config.get('api', {}).get('port', 7420)}/v1")
 
 
 def fill_backlight(win, content, height):

@@ -540,6 +540,9 @@ def build():
             _sub("Agent", [
                 _act("Reload the config", "reload"),
                 _act("Restore factory backlight", "restore_backlight"),
+                _bool("api/enabled", "App API"),
+                _num("api/port", "API port", step=1, lo=1, hi=65535),
+                _info("API: http://127.0.0.1:<port>/v1"),
                 _info("config: ~/.config/g510/config.json"),
             ]),
         ]),
