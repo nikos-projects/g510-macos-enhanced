@@ -10,12 +10,14 @@ missing device is treated as a normal state, not an error.
 import queue
 import signal
 import sys
+import queue
 import threading
 import time
 
 import actions
 import alerts
 import api
+import audio
 import autoscreen
 import beat
 import browse
@@ -27,6 +29,7 @@ import keytap
 import lcd
 import link
 import menu
+import mixer
 import notify
 import recorder
 import screens
@@ -63,17 +66,20 @@ GESTURE_SPAN = 0.7          # presses closer together than this are one gesture
 GESTURE_HOLD = 0.45         # how long one or two presses wait before firing
 HOLD_SECONDS = 0.5          # a key down this long is a hold, not a tap
 DOUBLE_KEYS = ("L2", "L3", "L4", "L5")     # twice: freeze the screen (E1)
-# Held: the settings menu on L2 (E2), the Discord browser on L3 (P6b).
-# Both *open* rather than toggle - esc is how the browser is left, and a
-# second hold of L2 is how the menu is, since the triple that used to shut
-# it is gone.
-HOLD_KEYS = {"L2": "menu", "L3": "browse"}
+# Held: the settings menu on L2 (E2), the Discord browser on L3 (P6b) and
+# the audio mixer on L4 (P7). All three *open* rather than toggle - esc is
+# how the browser and the mixer are left, and a second hold of L2 is how
+# the menu is, since the triple that used to shut it is gone.
+HOLD_KEYS = {"L2": "menu", "L3": "browse", "L4": "mixer"}
 # Three times: L5 writes a note (E3), L3 brings up the Discord screen (P6)
 # with the keys to drive it.
 TRIPLE_KEYS = {"L5": "note", "L3": "discord"}
 MENU_IDLE = 30.0            # a menu nobody touches closes itself
 NOTE_IDLE = 30.0            # typing a note nobody finishes abandons it
+MIXER_IDLE = 30.0           # a mixer nobody touches gives the keys back
 NOTE_MAX = 240              # how long a sticky note may be
+MIXER_POLL = 0.1            # how often the levels are read into the bars
+MIXER_RESCAN = 2.0          # how often the apps are looked for again
 
 
 def _find_channel(channels, wanted):
@@ -204,6 +210,22 @@ class Daemon:
         # thing happening on the screen, not a setting, so the config file
         # never learns about it either.
         self.browse = browse.Browser()
+        # The audio mixer, opened by holding L4 (P7). Runtime state like
+        # the browser above it: what the panel is showing is not a
+        # setting, so the config file never learns about it either. The
+        # levels are a CoreAudio tap of their own, opened and closed with
+        # the panel - and opened on a worker thread, because making an
+        # IOProc has been seen to take eleven seconds on this machine
+        # (P5) and this loop holds the only handle to the keyboard.
+        self.mixer = mixer.Mixer()
+        self.mixer_levels = None     # audio.Levels, once the taps are up
+        self.mixer_building = False  # whether a worker is opening them
+        self.mixer_generation = 0    # bumped on open and close, so a
+        # worker that finished after esc can tell and drop what it made
+        self.mixer_tapped = ()       # the pids the last attempt was for
+        self.mixer_seen = 0.0        # the last time the apps were looked for
+        self.mixer_poll = 0.0        # the last time the levels were read
+        self.mixer_jobs = None       # the queue of app-volume writes, made
         # The backlight dipping on the beat of the music (P5). The tap is
         # runtime state - opened and closed by `beat.enabled` - and so is
         # the pulse it triggers: the config says whether to dip and how
@@ -487,6 +509,10 @@ class Daemon:
             # So is a sticky note - it is a thing on the screen, and the
             # screen is what this process owns.
             return self.note_command(payload)
+        if command == "mixer":
+            # Like the note: a thing on the screen, so it lives here and
+            # not in the config file.
+            return self.mixer_command(payload)
         if command == "vencord":
             # The Discord screen is fed by this process's own localhost
             # server, which no keyboard and no config file has a say in.
@@ -814,12 +840,13 @@ class Daemon:
                 self.fire_lcd_key(name)
 
     def hold_key(self, name):
-        """What a key *held* down means: the menu on L2, the browser on L3.
+        """What a key *held* down means: the menu on L2, the browser on L3,
+        the mixer on L4.
 
-        A hold is a deliberate hand, so both answers are "come up" rather
-        than "go away": leaving is a tap of esc (the browser) or a second
-        hold (the menu), which is written on the panel for the menu and in
-        the README for this.
+        A hold is a deliberate hand, so all three answers are "come up"
+        rather than "go away": leaving is a tap of esc (the browser and
+        the mixer) or a second hold (the menu), which is written on the
+        panel for the menu and in the README for this.
         """
         action = HOLD_KEYS.get(name)
         if action == "menu":
@@ -829,6 +856,8 @@ class Daemon:
                 self.close_menu()
         elif action == "browse":
             self.start_browse()
+        elif action == "mixer":
+            self.start_mixer()
 
     def toggle_freeze(self, name=None):
         """Double press of a soft key: hold the screen where it is (E1).
@@ -1244,10 +1273,11 @@ class Daemon:
         being typed into - a letter pressed at a list still goes to the app
         underneath. Writing a note is modal the other way round: the note
         takes everything until enter or esc, because there is no list to be
-        sitting at. The Discord screen is narrower than either: only the
-        keys its pane has a use for, so a game can carry on being played at
-        with the letters while the arrows pick a channel - until a compose
-        starts, which is a note's rule and takes the lot.
+        sitting at. The Discord screen and the mixer are narrower than
+        either: only the keys their rows have a use for, so a game can
+        carry on being played at with the letters while the arrows pick a
+        channel or a volume - until a compose starts, which is a note's
+        rule and takes the lot.
         """
         if not self.menu.closed:
             if name in keytap.NAV_KEYS:
@@ -1255,7 +1285,9 @@ class Daemon:
             return bool(character) and self.menu_typing
         if self.note_draft is not None:
             return name in ("enter", "esc", "backspace") or bool(character)
-        return self.browse.wants(name, character)
+        if self.browse.active:
+            return self.browse.wants(name, character)
+        return self.mixer.wants(name, character)
 
     def open_menu(self):
         with self.menu_lock:
@@ -1297,7 +1329,7 @@ class Daemon:
     def refresh_menu(self, now):
         """Keys the tap took: the menu's while it is open, the note's while
         one is being written, the Discord screen's while it is being
-        driven, and nobody's otherwise."""
+        driven, the mixer's while it is up, and nobody's otherwise."""
         with self.menu_lock:
             if self.keytap is not None:
                 keys = self.keytap.drain()
@@ -1314,12 +1346,22 @@ class Daemon:
                         self.feed_browse(name, character)
                         if not self.browse.active:
                             break                   # esc let the keys go
+                elif self.mixer.active:
+                    for name, character in keys:
+                        self.feed_mixer(name, character)
+                        if not self.mixer.active:
+                            break                   # esc let the keys go
             if not self.menu.closed and now - self.menu_touch >= MENU_IDLE:
                 self.close_menu()
             if self.note_draft is not None and now - self.note_touch >= NOTE_IDLE:
                 self.note_draft = None
                 self.last_lcd = 0.0
                 log("note entry timed out")
+            if self.mixer.active and now - self.mixer.idle >= MIXER_IDLE:
+                # A mixer nobody is at must not go on holding the
+                # navigation keys away from the game underneath it, for
+                # the same reason the menu closes itself.
+                self.close_mixer("nobody touched it")
             if self.browse.typing and now - self.browse.touch >= browse.IDLE_COMPOSE:
                 # Nobody has gone on with the message: back to the
                 # messages it was answering, keys and all. The draft is
@@ -1360,6 +1402,10 @@ class Daemon:
                     # over a screen whose keys it does not have: the
                     # browser lets go first, the way the menu does.
                     self.close_browse("a note took the panel")
+                if self.mixer.active:
+                    # And so does the mixer, for the same reason - a row
+                    # nobody can see would be a row nobody could pick.
+                    self.close_mixer("a note took the panel")
                 self.note_draft = ""
                 self.note_touch = time.time()
                 log("note: type it, enter pins it, esc cancels")
@@ -1424,6 +1470,8 @@ class Daemon:
                 return False
             if not self.menu.closed:
                 self.close_menu()
+            if self.mixer.active:
+                self.close_mixer("the browser took the panel")
             if self.browse.active:
                 return True
             self.browse.open()
@@ -1489,6 +1537,257 @@ class Daemon:
             # Whose answer matters: the next ack with this number or past
             # it is the one saying whether the message went out.
             self.browse.sent(reply.get("n"), now)
+
+    # -- the mixer (P7) -----------------------------------------------------
+
+    def start_mixer(self):
+        """Bring the mixer up - what holding L4 asks for.
+
+        The same answer as `press_menu` is not: esc lets go of this one,
+        so a second hold would just be a hold at nothing. What is owed
+        instead is a scan for apps that are making sound, and that runs
+        on a worker because making the taps has been seen to take eleven
+        seconds on this machine while this loop holds the only handle to
+        the keyboard (P5).
+        """
+        with self.menu_lock:
+            if not self.menu.closed:
+                self.close_menu()
+            if self.note_draft is not None:
+                self.note_draft = None
+            if self.mixer.active:
+                self.mixer.touch = time.time()
+                return
+            self.mixer.open()
+            self.mixer_generation += 1
+            self.mixer_tapped = ()
+            self.mixer_levels = None
+            self.mixer_building = False
+            self.mixer_seen = 0.0
+            self.mixer_poll = 0.0
+            self.last_lcd = 0.0
+            log("mixer on - arrows pick, left right volume, esc lets go")
+        self.refresh_mixer(time.time())
+
+    def close_mixer(self, why):
+        """Let the mixer go, and the taps with it."""
+        with self.menu_lock:
+            if not self.mixer.active and self.mixer_levels is None \
+                    and not self.mixer_building:
+                return
+            self.mixer.close()
+            # Bumped first: a worker still opening the taps will see the
+            # new number and drop what it made rather than leave an
+            # aggregate device listening in the background for ever.
+            self.mixer_generation += 1
+            levels, self.mixer_levels = self.mixer_levels, None
+            self.mixer_building = False
+            self.mixer_tapped = ()
+            self.last_lcd = 0.0
+            log(f"mixer off - {why}")
+        if levels is not None:
+            self._stop_mixer_levels(levels)
+
+    @staticmethod
+    def _stop_mixer_levels(levels):
+        """Close a tap off the poll thread: stopping a device has been
+        seen to block, and this loop holds the only handle to the
+        keyboard."""
+        threading.Thread(target=levels.stop, daemon=True,
+                         name="mixer-stop").start()
+
+    def feed_mixer(self, name, character=None):
+        """One key the tap took, while the mixer has the panel."""
+        with self.menu_lock:
+            if not self.mixer.active:
+                return
+            for action in self.mixer.press(name, character):
+                self._mixer_action(action)
+
+    def _mixer_action(self, action):
+        """Run what a key asked for. The keys only ever *ask*: this is
+        the one place that touches CoreAudio's volume properties, so a
+        refused write lands here rather than in the panel."""
+        if not action:
+            return
+        kind = action[0]
+        if kind == "close":
+            self.close_mixer("esc")
+        elif kind == "volume":
+            self._mixer_volume(str(action[1]), int(action[2]))
+        elif kind == "mute":
+            self._mixer_mute()
+
+    def _mixer_volume(self, key, delta):
+        if key == mixer.SYSTEM:
+            # Straight property writes: microseconds, so this can be
+            # done where it was asked for and the number shows up on
+            # the panel in the same breath.
+            current = audio.volume()
+            if current is None:
+                return
+            value = audio.set_volume((current * 100.0 + delta) / 100.0)
+            if value is not None:
+                self.mixer.set_volume(mixer.SYSTEM, value * 100.0)
+                self.last_lcd = 0.0
+        else:
+            # An app's own volume is an AppleScript round trip with a
+            # three second timeout (see `audio.app_volume`), and this
+            # thread holds the only handle to the keyboard - so Music
+            # being wedged gets to be slow over there instead of
+            # freezing every key for three seconds at a time. Queued
+            # behind one worker so two presses cannot both read the
+            # same old volume and lose one of the writes.
+            self._mixer_async(lambda: self._set_app_volume(key, delta))
+
+    def _set_app_volume(self, key, delta):
+        value = audio.change_app_volume(key, delta)
+        if value is not None:
+            with self.menu_lock:
+                if self.mixer.set_volume(key, value):
+                    self.last_lcd = 0.0
+
+    def _mixer_mute(self):
+        on = not bool(audio.muted() or False)
+        if audio.set_muted(on) is not None:
+            self.mixer.set_muted(on)
+            self.last_lcd = 0.0
+
+    def _mixer_async(self, job):
+        """Queue `job` on the mixer's one worker, or run it if there is
+        no worker yet - the first press makes it.
+
+        One thread and a queue rather than a thread per press: the jobs
+        have to happen in the order they were asked for, or a second
+        left-press could write the volume the first one just read.
+        """
+        with self.menu_lock:
+            if self.mixer_jobs is None:
+                # One worker for the life of the agent, and a daemon
+                # thread: it goes with the process rather than having to
+                # be told to stop.
+                self.mixer_jobs = queue.Queue()
+                threading.Thread(target=self._mixer_worker, daemon=True,
+                                 name="mixer-jobs").start()
+            self.mixer_jobs.put(job)
+
+    def _mixer_worker(self):
+        jobs = self.mixer_jobs
+        while True:
+            try:
+                jobs.get()()
+            except Exception as exc:
+                log(f"mixer: {exc}")
+
+    def _spawn_mixer(self, generation, apps):
+        """Open the taps for `apps`, on a thread of its own.
+
+        The generation is the whole point: `AudioDeviceCreateIOProcID`
+        has been seen to take eleven seconds, and esc can be pressed
+        while it does. A worker that comes back to a newer number knows
+        the panel is gone and closes what it opened instead of leaving
+        an aggregate device running with nothing watching it.
+        """
+        def job():
+            self._mixer_job(generation, apps)
+        self.mixer_building = True
+        threading.Thread(target=job, daemon=True, name="mixer-open").start()
+
+    def _mixer_job(self, generation, apps):
+        levels = audio.Levels(log=log)
+        try:
+            opened = levels.start(apps)
+        except Exception as exc:
+            log(f"mixer: the taps could not be opened: {exc}")
+            opened = False
+        with self.menu_lock:
+            if generation != self.mixer_generation or not self.mixer.active:
+                stale = True
+            else:
+                stale = False
+                self.mixer_building = False
+                if opened:
+                    self.mixer_levels = levels
+                else:
+                    # One attempt per set of pids, and no retry loop: an
+                    # app that will not be tapped is a fact about that
+                    # app, and asking again a second later would be a
+                    # spin on the poll loop's own thread.
+                    self.mixer_tapped = tuple(
+                        int(app.get("pid") or 0) for app in apps)
+        if stale:
+            levels.stop()
+            return
+        self.last_lcd = 0.0
+
+    def refresh_mixer(self, now):
+        """One pass over the mixer while it is up, from the poll loop.
+
+        Only the levels are read here - a lock and a dict copy, and a
+        redraw only when a bar actually moved. *Finding* the apps is
+        left to a worker, because that asks NSWorkspace what is running
+        and Music what its volume is, and the second of those is an
+        AppleScript that can wait three seconds on a wedged app: this
+        loop holds the only handle to the keyboard (P5).
+        """
+        with self.menu_lock:
+            if not self.mixer.active:
+                return
+            levels = self.mixer_levels
+            if levels is not None and now - self.mixer_poll >= MIXER_POLL:
+                self.mixer_poll = now
+                if self.mixer.set_levels(levels.poll()):
+                    self.last_lcd = 0.0
+            if now - self.mixer_seen < MIXER_RESCAN or self.mixer_building:
+                return
+            self.mixer_seen = now
+            generation = self.mixer_generation
+        self._scan_async(generation)
+
+    def _scan_async(self, generation):
+        """Find what is playing, on a thread of its own."""
+        threading.Thread(target=self._mixer_scan, args=(generation,),
+                         daemon=True, name="mixer-scan").start()
+
+    def _mixer_scan(self, generation):
+        """What is making sound, then the taps for exactly that.
+
+        The taps are rebuilt here rather than in the poll loop for the
+        same reason they are opened on a thread: an app that starts
+        playing has to be added to the aggregate, and opening one has
+        been seen to take eleven seconds on this machine.
+        """
+        apps = audio.candidates()
+        volume, muted = audio.volume(), audio.muted()
+        with self.menu_lock:
+            if generation != self.mixer_generation or not self.mixer.active:
+                return
+            self.mixer.set_system(volume, muted)
+            self.mixer.set_apps(apps)
+            wanted = tuple(int(app.get("pid") or 0) for app in apps)
+            if wanted != self.mixer_tapped and not self.mixer_building:
+                # The apps changed - something new started playing, or an
+                # old one quit - so the taps have to be rebuilt around
+                # them. `mixer_tapped` is written before the worker is
+                # even started, so the next scan a second later does not
+                # ask for the same thing again while the last one is
+                # still opening.
+                self.mixer_tapped = wanted
+                self._spawn_mixer(generation, apps)
+                names = ", ".join(str(app.get("name") or "?")
+                                  for app in apps) or "nothing"
+                log(f"mixer: hearing {names}")
+            self.last_lcd = 0.0
+
+    def mixer_command(self, payload):
+        """What `g510 mixer [on|off]` asks the agent to do."""
+        action = str(payload.get("action") or "show")
+        with self.menu_lock:
+            if action in ("on", "open", "show"):
+                self.start_mixer()
+            elif action in ("off", "close"):
+                self.close_mixer("the command said so")
+            return {"ok": True, "active": self.mixer.active}
 
     def vencord_command(self, payload):
         """What `g510 discord ...` asks of the plugin behind the screen.
@@ -1833,22 +2132,26 @@ class Daemon:
         menu_open = not self.menu.closed
         note = self.note_active
         browsing = self.browse.active
-        if not lcd_config.get("enabled", True) and not (menu_open or note):
+        mixing = self.mixer.active
+        if not lcd_config.get("enabled", True) and not (menu_open or note
+                                                        or mixing):
             # Blank: nothing to keep in step, so autoscreen forgets what it
             # last put up and takes the config as it finds it when the
             # display comes back. The menu is exempt - it is how the display
             # gets turned back on - and so is a note, because the key press
-            # that put it there has to be visible while it is answered.
+            # that put it there has to be visible while it is answered, and
+            # so is the mixer for the same reason: bars nobody can see are
+            # bars that may as well not be measured.
             # (A browser never gets here: it is closed above.)
             self.autoscreen.rest()
             return
-        if self.record_state or menu_open or note or browsing:
+        if self.record_state or menu_open or note or browsing or mixing:
             # MR while it records, the menu while it is open, a note
-            # while it is up and the browser while it is being driven all
-            # own the display, so autoscreen stands down rather than
-            # switching under them. Between them they cover every moment,
-            # so the screen underneath is never touched and simply comes
-            # back.
+            # while it is up, the browser while it is being driven and the
+            # mixer while it is up all own the display, so autoscreen
+            # stands down rather than switching under them. Between them
+            # they cover every moment, so the screen underneath is never
+            # touched and simply comes back.
             self.autoscreen.rest()
         else:
             self.refresh_autoscreen(now)
@@ -1875,6 +2178,18 @@ class Daemon:
             if self.held_alert != alert["until"]:
                 self.held_alert = alert["until"]
                 log("banner held back - the browser has the keys")
+            alert = None
+        elif alert and mixing:
+            # The same bargain with the mixer, for a slightly different
+            # reason: it does not hold text that a banner would cover, it
+            # holds *bars*, and a box over the top row for four seconds
+            # is four seconds of the levels not being readable - which is
+            # the entire thing the panel was opened for. Its own log
+            # line, because "the browser has the keys" would be a lie
+            # about which panel swallowed the arrows.
+            if self.held_alert != alert["until"]:
+                self.held_alert = alert["until"]
+                log("banner held back - the mixer has the keys")
             alert = None
         if bool(alert) != self.alerting:
             self.alerting = bool(alert)
@@ -1935,6 +2250,20 @@ class Daemon:
                     pixels = screens.render("discord", self.state)
                 finally:
                     self.state.pop("browse", None)
+            elif mixing:
+                # An interruption, not a screen: the mixer does not
+                # write `lcd.screen`, so whatever the display was
+                # showing goes on being chosen underneath it and is
+                # simply what comes back when esc lets go. Lowest of the
+                # interruptions because everything above it can close it
+                # - a note takes it, the browser takes it, an alert is
+                # held back behind it only for as long as it is up.
+                with self.menu_lock:
+                    self.state["mixer"] = self.mixer.view()
+                try:
+                    pixels = screens.render("mixer", self.state)
+                finally:
+                    self.state.pop("mixer", None)
             else:
                 pixels = screens.render(lcd_config.get("screen", "status"),
                                         self.state)
@@ -2092,6 +2421,7 @@ class Daemon:
                 self.handle_gkeys()
                 self.refresh_gestures(now)
                 self.refresh_menu(now)
+                self.refresh_mixer(now)
                 self.refresh_alerts(now)
                 self.refresh_triggers(now)
                 self.refresh_lcd(now)
@@ -2108,6 +2438,16 @@ class Daemon:
 
     def shutdown(self):
         log("g510 daemon stopping")
+        # The mixer's taps, before anything else: an aggregate device
+        # left running would go on listening to every application that
+        # plays a sound after this process is gone.
+        levels, self.mixer_levels = self.mixer_levels, None
+        self.mixer_generation += 1
+        if levels is not None:
+            try:
+                levels.stop()
+            except Exception:
+                pass
         if self.keytap is not None:
             try:
                 self.keytap.stop()

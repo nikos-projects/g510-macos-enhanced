@@ -1037,6 +1037,58 @@ def screen_note(canvas, state):
         canvas.text(line, 2, 1 + index * 14, 11)
 
 
+def _width(canvas, string, size, limit):
+    """`_fit` against a column rather than against the whole panel."""
+    if canvas.measure(string, size) <= limit:
+        return string
+    while string and canvas.measure(string + "...", size) > limit:
+        string = string[:-1]
+    return (string + "...") if string else ""
+
+
+def screen_mixer(canvas, state):
+    """The audio mixer: what is playing, and how loud each of them is.
+
+    A header and up to three rows - the panel has room for no more than
+    the browser's list gets - and the list scrolls rather than growing.
+    Each row is a name, a bar and a number.
+
+    The bar is what the app is *doing*, sampled off its own process tap,
+    except on the system row where it is the system volume; the number is
+    the thing the left and right keys move, which is a volume where macOS
+    will let one be set and the level where it will not. So a bar can sit
+    still while its number changes, and that is right: they are reporting
+    two different things.
+    """
+    view = state.get("mixer") or {}
+    canvas.text(_fit(canvas, str(view.get("title") or "MIXER"), 10), 2, 0, 10)
+    corner = time.strftime("%H:%M")
+    canvas.text(corner, LCD_RIGHT - canvas.measure(corner, 10), 1, 10)
+    rows = list(view.get("rows") or [])
+    for index, row in enumerate(rows):
+        y = 13 + index * 10
+        mark = ">" if row.get("selected") else " "
+        canvas.text(_width(canvas, mark + str(row.get("name") or "?"), 9, 56),
+                    2, y, 9)
+        value = str(row.get("value") or "")
+        wide = canvas.measure(value, 9)
+        canvas.text(value, LCD_RIGHT - wide, y, 9)
+        bar_x = 60
+        bar_w = int(LCD_RIGHT - wide - 2 - bar_x)
+        if bar_w >= 8:
+            if row.get("kind") == "system":
+                fraction = float(row.get("volume") or 0.0) / 100.0
+            else:
+                fraction = float(row.get("level") or 0.0)
+            canvas.bar(bar_x, y + 1, bar_w, 7, fraction)
+    hint = str(view.get("hint") or "")
+    # Only where the apps would be, which is only ever under a lone
+    # system row - the hint says what is missing, so there has to be room
+    # for it to be missing in.
+    if hint and len(rows) <= 1:
+        canvas.text(_fit(canvas, hint, 10), 2, 13 + len(rows) * 10 + 4, 10)
+
+
 def _wrap(canvas, text, size, lines=2):
     """Break text across up to `lines` of the panel, cutting what will not
     fit and saying so. `lines=None` wraps all of it instead, which is what
@@ -1105,11 +1157,11 @@ SCREENS = {
 }
 
 # Not in the cycle: the daemon switches to these itself, while MR is
-# recording, an alert is up, the menu is open or a note is pinned, and no
-# rule or key can ask for them.
+# recording, an alert is up, the menu is open, a note is pinned or the
+# mixer is being driven, and no rule or key can ask for them.
 SCREENS_INTERNAL = {"record": screen_record, "timeralert": screen_timeralert,
                     "message": screen_message, "menu": screen_menu,
-                    "note": screen_note}
+                    "note": screen_note, "mixer": screen_mixer}
 
 
 def render(name, state):
