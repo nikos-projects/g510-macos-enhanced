@@ -342,6 +342,21 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(
             held.count("banner held back - the browser has the keys"), 1)
 
+    def test_channels_saying_hidden_are_not_listed(self):
+        # A hidden-channel plugin puts every one of them in the list, and
+        # there are far too many of them to scroll past on a 3-row panel.
+        self.agent.link = self.connected(channels=[
+            {"id": "1", "name": "general", "unread": 0, "mentions": 0},
+            {"id": "2", "name": "#hidden-secret", "unread": 3},
+            {"id": "3", "name": "Hidden", "unread": 0},
+            {"id": "4", "name": "music", "unread": 1}])
+        self.press("L3", 100.0, times=3)
+        self.agent.refresh_gestures(100.2 + daemon.GESTURE_HOLD)
+        self.agent.browse.update(self.agent.link.state(), 200.0)
+        self.assertEqual(
+            [row["name"] for row in self.agent.browse._state["channels"]],
+            ["general", "music"])
+
     def test_the_message_takes_the_panel_once_the_keys_are_handed_back(self):
         # It only waited: still inside its own seconds, it is what the
         # panel shows the moment there is nothing else on it.

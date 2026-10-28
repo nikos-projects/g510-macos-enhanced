@@ -226,6 +226,18 @@ class Browser:
             self.older_for = open_id
             self.older_n = 0
 
+        # A client with a hidden-channel plugin lists every hidden channel
+        # it can see, and Discord has a great many of them - enough that
+        # the handful anyone can actually open is a page of scrolling
+        # away. Filtered here rather than in the plugin so nothing has to
+        # be rebuilt, and by name because the name is all the push
+        # carries for them.
+        listed_channels = self._state.get("channels") or []
+        shown = [row for row in listed_channels
+                 if "hidden" not in str(row.get("name") or "").lower()]
+        if shown != listed_channels:
+            self._state = {**self._state, "channels": shown}
+
         listed = str(self._state.get("list") or "")
         if listed and self.pending_list == listed:
             self.pending_list = None
