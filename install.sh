@@ -35,6 +35,7 @@ echo "  g510 --help                          what it can do"
 echo "  g510 start                           run the agent, and at login"
 echo "  venv/bin/python gui.py               the menu bar app and window"
 echo "  ./make-dmg.sh                        build the installable app"
+echo "  ./make-exec.sh                       or one self-contained executable"
 echo
 echo "Grant Input Monitoring (to read G-keys) and, for keys/text bindings,"
 echo "Accessibility. Check with: g510 permissions"
