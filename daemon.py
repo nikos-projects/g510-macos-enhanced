@@ -1551,13 +1551,20 @@ class Daemon:
         the keyboard (P5).
         """
         with self.menu_lock:
+            if not self.ensure_tap():
+                # Without it the arrows are never taken, so the panel
+                # would be a picture that cannot be moved - which is the
+                # one thing it is for.
+                log("mixer cannot take keys: "
+                    + (self.keytap.error if self.keytap else "no event tap"))
+                return False
             if not self.menu.closed:
                 self.close_menu()
             if self.note_draft is not None:
                 self.note_draft = None
             if self.mixer.active:
                 self.mixer.touch = time.time()
-                return
+                return True
             self.mixer.open()
             self.mixer_generation += 1
             self.mixer_tapped = ()
@@ -1568,6 +1575,7 @@ class Daemon:
             self.last_lcd = 0.0
             log("mixer on - arrows pick, left right volume, esc lets go")
         self.refresh_mixer(time.time())
+        return True
 
     def close_mixer(self, why):
         """Let the mixer go, and the taps with it."""
@@ -1603,6 +1611,10 @@ class Daemon:
                 return
             for action in self.mixer.press(name, character):
                 self._mixer_action(action)
+            # Every key draws: picking a row moves only a `>`, and
+            # waiting the normal second for the panel to say so makes
+            # the keys feel like they were not heard.
+            self.last_lcd = 0.0
 
     def _mixer_action(self, action):
         """Run what a key asked for. The keys only ever *ask*: this is
@@ -1784,7 +1796,11 @@ class Daemon:
         action = str(payload.get("action") or "show")
         with self.menu_lock:
             if action in ("on", "open", "show"):
-                self.start_mixer()
+                if not self.start_mixer():
+                    return {"ok": False,
+                            "error": "the mixer cannot take keys - the "
+                                     "event tap would not start (check "
+                                     "Input Monitoring)"}
             elif action in ("off", "close"):
                 self.close_mixer("the command said so")
             return {"ok": True, "active": self.mixer.active}

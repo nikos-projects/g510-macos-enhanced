@@ -354,6 +354,21 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(self.agent.mixer.active)
         self.assertTrue(self.agent.browse.active)
 
+    def test_holding_L4_starts_the_event_tap_that_takes_the_arrows(self):
+        # The tap is what *takes* the keys in the first place - without
+        # it the arrows go on to whatever app is in front, and a panel
+        # that cannot be moved is a picture.
+        self.agent.keytap = None
+        with mock.patch.object(self.agent, "ensure_tap",
+                               return_value=True) as tapped:
+            self.assertTrue(self.agent.start_mixer())
+        tapped.assert_called_once()
+
+    def test_the_mixer_refuses_to_open_without_the_keys(self):
+        with mock.patch.object(self.agent, "ensure_tap", return_value=False):
+            self.assertFalse(self.agent.start_mixer())
+        self.assertFalse(self.agent.mixer.active)
+
     def test_letting_go_with_esc_hands_the_keys_back(self):
         moment = self.open_mixer()
         self.agent.feed_mixer("esc", None)
@@ -402,6 +417,16 @@ class AgentTests(unittest.TestCase):
         self.agent.refresh_menu(200.0)
         self.assertFalse(self.agent.mixer.active)       # esc was the last
         self.assertEqual(self.agent.mixer.index, 0)     # up then down
+
+    def test_a_key_at_the_mixer_redraws_the_panel_right_away(self):
+        # Picking a row moves a single `>` - waiting the normal second
+        # for the panel to say so makes the keys feel unheard.
+        self.open_mixer()
+        self.agent.mixer.set_apps([MUSIC])
+        self.agent.last_lcd = 50.0
+        self.agent.feed_mixer("down", None)
+        self.assertEqual(self.agent.mixer.index, 1)
+        self.assertEqual(self.agent.last_lcd, 0.0)
 
     # -- what the rescan asks for
 
