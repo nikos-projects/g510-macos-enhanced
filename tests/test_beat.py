@@ -27,12 +27,14 @@ class FakeTap:
 
     def __init__(self):
         self.levels = []
+        self.basses = []          # the low band beside each level, if said
         self.stopped = False
 
     def poll(self, now):
         if self.levels:
-            return True, self.levels.pop(0)
-        return False, 0.0
+            bass = self.basses.pop(0) if self.basses else 0.0
+            return True, self.levels.pop(0), bass
+        return False, 0.0, 0.0
 
     def stop(self):
         self.stopped = True
@@ -46,6 +48,10 @@ class DetectorTests(unittest.TestCase):
 
     def push(self, now, level):
         return self.detector.push(level, now)
+
+    def push_bass(self, now, level, bass):
+        """One arrival with its low band - the second detector's feed."""
+        return self.detector.push(level, now, bass)
 
     def test_the_first_level_is_never_a_beat(self):
         # It seeds both averages at itself, so there is nothing for it
@@ -92,6 +98,63 @@ class DetectorTests(unittest.TestCase):
 
     def test_a_level_that_is_not_a_number_is_not_a_beat(self):
         self.assertFalse(self.detector.push("loud", 100.0))
+
+    def test_a_kick_only_the_low_band_sees_is_a_beat(self):
+        # A mastered track pins every broadband sample to the ceiling,
+        # so the level never rises however hard the kick hits - but the
+        # weight of it under 160Hz still rises and falls, and that edge
+        # has to count or a brickwalled song never pulses at all.
+        self.push_bass(0.0, 0.90, 0.05)
+        self.push_bass(0.1, 0.90, 0.05)
+        self.assertFalse(self.push_bass(0.2, 0.90, 0.05))
+        self.assertTrue(self.push_bass(0.5, 0.90, 0.30))
+        # The very same arrivals with no band beside them, which is
+        # what this detector used to see, are nothing at all.
+        plain = beat.Detector()
+        self.assertEqual([plain.push(0.90, now) for now in
+                          (0.0, 0.1, 0.2, 0.5)],
+                         [False, False, False, False])
+
+    def test_a_low_band_that_does_not_move_is_not_a_beat(self):
+        # Flat music, both bands: the second detector must not invent
+        # hits the first one is right to ignore.
+        self.push_bass(0.0, 0.90, 0.05)
+        for step in range(1, 12):
+            self.assertFalse(self.push_bass(step * 0.05, 0.90, 0.05))
+
+    def test_two_edges_share_one_pulse_clock(self):
+        # A broadband hit and then a bass hit a heartbeat apart are one
+        # pulse, not two: the gap is a single clock for both edges, or
+        # a kick that lifts both bands would flash the backlight twice.
+        self.push_bass(0.0, 0.02, 0.05)
+        self.push_bass(0.1, 0.02, 0.05)
+        self.assertTrue(self.push_bass(0.5, 0.60, 0.05))    # broadband
+        # The bass leaps while the broadband stays up: a rise by every
+        # rule except the clock.
+        self.assertFalse(self.push_bass(0.55, 0.60, 0.30))
+
+    def test_the_knob_governs_the_low_band_too(self):
+        # One small bass rise: ignored at the bottom, where it has to
+        # clear the slow average by twice as much again, and counted at
+        # the top, where any rise at all is enough.
+        def arrive(detector, bass):
+            detector.push(0.90, 0.0, 0.10)
+            detector.push(0.90, 0.1, 0.10)
+            return detector.push(0.90, 0.5, bass)
+        self.assertFalse(arrive(beat.Detector(0), 0.13))
+        self.assertTrue(arrive(beat.Detector(100), 0.13))
+
+    def test_without_a_low_band_it_answers_exactly_as_it_used_to(self):
+        # bass=None is the old caller, and its answers must not have
+        # moved by so much as a word - the second detector is a thing
+        # that was *added*, not a thing that was changed.
+        old, new = beat.Detector(), beat.Detector()
+        arrivals = [(0.5, 0.02), (0.6, 0.10), (0.6, 0.40),
+                    (0.62, 0.41), (1.3, 0.44), (1.5, 0.90)]
+        said_old = [old.push(level, now) for now, level in arrivals]
+        said_new = [new.push(level, now, None) for now, level in arrivals]
+        self.assertEqual(said_old, said_new)
+        self.assertIn(True, said_old)
 
 
 class PulseSettingsTests(unittest.TestCase):
@@ -319,6 +382,27 @@ class TheDip(unittest.TestCase):
         self.agent.refresh_beat(100.6)      # halfway up, no new level
         self.assertEqual(self.written(),
                          config.apply_brightness(self.base, 75))
+
+    def test_a_kick_only_the_low_band_hears_still_dips(self):
+        # This is the case the second detector exists for: a mastered
+        # track whose broadband level sits on the ceiling while the
+        # kicks keep coming underneath it.
+        tap = self.listen(amount=50, decay=1.0)
+        tap.levels = [0.90, 0.90]
+        tap.basses = [0.05, 0.30]
+        self.agent.refresh_beat(100.0)
+        self.assertEqual(self.agent.keyboard.set_backlight.call_count, 0)
+        self.agent.refresh_beat(100.1)
+        self.assertEqual(self.written(),
+                         config.apply_brightness(self.base, 50))
+
+    def test_a_low_band_that_does_not_move_does_not_dip(self):
+        tap = self.listen(amount=50, decay=1.0)
+        tap.levels = [0.90, 0.90]
+        tap.basses = [0.05, 0.05]
+        self.agent.refresh_beat(100.0)
+        self.agent.refresh_beat(100.1)
+        self.agent.keyboard.set_backlight.assert_not_called()
 
     def test_the_climb_is_paced_rather_than_written_on_every_tick(self):
         tap = self.listen(amount=50, decay=1.0)

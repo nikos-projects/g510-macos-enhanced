@@ -2,10 +2,13 @@
 
 Two halves that meet only in a bool. `Listener` is a CoreAudio process
 tap: it hears everything the Mac is playing and hands over the loudest
-sample of each callback, which is a level about ninety times a second.
-`Detector` decides whether such a level was a beat, and the agent turns
-a "yes" into a dip of the backlight that climbs back over `decay`
-seconds.
+sample of each callback - the whole spectrum, and again everything under
+`BASS_HZ` alone. `Detector` decides whether such a level was a beat,
+watching both bands, and the agent turns a "yes" into a dip of the
+backlight that climbs back over `decay` seconds. The second band exists
+because mastering pins the *peaks* of a loud track to the ceiling: a
+kick then leaves the level exactly where it was, while the weight of it
+under the line still rises and falls plainly.
 
 The tap is expensive enough to be worth opting into - it is a
 system-wide audio tap plus an aggregate device - so `beat.enabled`
@@ -31,6 +34,29 @@ RATIO = 1.6       # fast has to be this far ahead of slow
 FLOOR = 0.05      # under this it is room tone, not music
 FAST = 0.05       # seconds: how fast the fast average follows
 SLOW = 0.6        # seconds: how fast the slow one does
+
+# The band a drum actually lives in, watched as a second detector beside
+# the one above. Mastering flattens the *peaks* of a track - a loud,
+# limited song has every sample near the ceiling, so a kick can leave
+# the level exactly where it was - but it cannot flatten where the
+# energy sits: a kick still puts its weight under this line while the
+# vocals and cymbals that hold the level up are rejected by it. 160 Hz
+# is above a kick's fundamental and below the middle of everything else.
+BASS_HZ = 160.0
+DEFAULT_RATE = 48000.0          # if the device will not say what it runs at
+NOMINAL_RATE = 0x6E6F6D72       # 'nomr' - kAudioDevicePropertyNominalSampleRate
+
+
+def _lowpass_alpha(hz, rate):
+    """The one-pole coefficient that splits the band at `hz`.
+
+    One multiply and one add per sample, which is all this may cost: it
+    runs on CoreAudio's own thread inside the IOProc, where nothing can
+    block and nothing can raise. A one-pole is a gentle slope rather
+    than a wall, and that is fine - the low detector only needs a kick's
+    weight to *dominate* the band, not the rest of the spectrum gone.
+    """
+    return 1.0 - math.exp(-2.0 * math.pi * hz / rate)
 
 # How eager the detector is, 0 to 100. It is the one number of the five
 # worth putting on a menu: the gap and the two time constants are about
@@ -151,9 +177,12 @@ class Detector:
     def __init__(self, sensitivity=DEFAULT_SENSITIVITY):
         self.fast = None          # average that follows the level closely
         self.slow = None          # one that does not
+        self.bass_fast = None     # the same two, over the low band alone
+        self.bass_slow = None
         self.at = 0.0             # when the last level arrived
         self.last = 0.0           # when the last beat was called one
         self.raised = False       # whether fast is already clear of slow
+        self.bass_raised = False  # and whether the low band's already is
         self.set_sensitivity(sensitivity)
 
     def set_sensitivity(self, sensitivity):
@@ -172,12 +201,34 @@ class Detector:
         self.ratio = 1.0 + (RATIO - 1.0) * scale
         self.floor = FLOOR * scale
 
-    def push(self, level, now):
-        """Take one level. True when it was a beat."""
+    def push(self, level, now, bass=None):
+        """Take one level, and the low band's beside it. True on a beat.
+
+        `bass` is the same instant filtered to under `BASS_HZ`, and it
+        runs through its own pair of averages - a brickwalled track has
+        its broadband level pinned at the ceiling, so no rise is visible
+        there while the weight of a kick under that line rises and falls
+        plainly. Either edge counts, once: they share `GAP` and the
+        floor, because a kick usually lifts both and two pulses for one
+        hit would strobe. `bass=None` is an old caller (or a test) with
+        no band to give, and then only the broadband pair runs, which is
+        exactly what it did before.
+        """
         try:
             level = float(level)
         except (TypeError, ValueError):
             return False
+        if bass is not None:
+            try:
+                bass = float(bass)
+            except (TypeError, ValueError):
+                bass = None
+            if bass is not None and self.bass_fast is None:
+                # Seed the low band at its own first level, the way the
+                # pair above is seeded: starting the two apart would
+                # call that first reading a jump.
+                self.bass_fast = self.bass_slow = bass
+                self.bass_raised = False
         if self.fast is None:
             # The first level seeds both averages at itself: starting
             # them apart would call that first reading a jump.
@@ -195,7 +246,20 @@ class Detector:
         # inside the gap belongs to the first one, and the fast average
         # has to come back down before the next one can be a rise.
         self.raised = clear
-        if not rising or level < self.floor or now - self.last < GAP:
+        # The floor is asked of the *broadband* level for both edges:
+        # room tone is how loud the room is, and the filtered band is
+        # always the quieter of the two by construction.
+        hit = rising and level >= self.floor
+        if bass is not None:
+            self.bass_fast += (bass - self.bass_fast) * \
+                (1.0 - math.exp(-span / FAST))
+            self.bass_slow += (bass - self.bass_slow) * \
+                (1.0 - math.exp(-span / SLOW))
+            bass_clear = self.bass_fast > self.bass_slow * self.ratio
+            bass_rising = bass_clear and not self.bass_raised
+            self.bass_raised = bass_clear
+            hit = hit or (bass_rising and level >= self.floor)
+        if not hit or now - self.last < GAP:
             return False
         self.last = now
         return True
@@ -214,7 +278,11 @@ class Listener:
         self.log = log
         self.lock = threading.Lock()
         self.level = 0.0          # loudest sample since the last poll
+        self.bass = 0.0           # loudest sample of its low band
         self.fresh = False        # whether there is one to hand over
+        self.rate = DEFAULT_RATE  # what the callback runs at, once known
+        self._alpha = _lowpass_alpha(BASS_HZ, DEFAULT_RATE)
+        self._lowpass = 0.0       # the filter's memory, callback thread only
         self.core = None
         self.desc = None          # the recipe, kept for the tap's life
         self.tap = 0
@@ -232,6 +300,18 @@ class Listener:
             self.tap = core.create_tap(self.desc)
             uid = core.tap_uid(self.tap)
             self.agg = core.create_aggregate(uid)
+            # The band split is a coefficient of the sample rate, so the
+            # device is asked what it runs at before anything is
+            # filtered. Best-effort and read-only: a device that will
+            # not say keeps the default, and a wrong number only moves
+            # the line a little rather than costing a beat.
+            try:
+                rate = core.sample_rate(self.agg)
+                if rate and rate > 0:
+                    self.rate = float(rate)
+                    self._alpha = _lowpass_alpha(BASS_HZ, self.rate)
+            except Exception:
+                pass
             self.callback, self.ioid = core.create_ioproc(self.agg,
                                                           self._on_audio)
             core.start_device(self.agg, self.ioid)
@@ -265,16 +345,20 @@ class Listener:
         del callback, desc
 
     def poll(self, now):
-        """(whether a buffer arrived, the loudest sample in it).
+        """(whether a buffer arrived, the loudest sample in it, the
+        loudest sample of its low band).
 
         Two callbacks can land inside one 4ms tick of the loop, so the
         louder of them is kept rather than the later: losing the peak of
-        a transient is exactly how a beat goes unnoticed.
+        a transient is exactly how a beat goes unnoticed. The low band
+        is kept the same way and for the same reason - it is the half
+        that still hears a kick when mastering has pinned the peaks.
         """
         with self.lock:
             fresh, self.fresh = self.fresh, False
             level, self.level = self.level, 0.0
-        return fresh, level
+            bass, self.bass = self.bass, 0.0
+        return fresh, level, bass
 
     def _on_audio(self, _device, _when, input_list,
                   _in_time, _out_list, _out_time, _client):
@@ -288,6 +372,12 @@ class Listener:
             buffers = ctypes.cast(input_list,
                                   ctypes.POINTER(AudioBufferList)).contents
             peak = 0.0
+            bass = 0.0
+            # The band split, kept across callbacks: the filter's memory
+            # is the whole point of a one-pole, and this thread is the
+            # only one that ever touches it.
+            alpha = self._alpha
+            low = self._lowpass
             for index in range(buffers.mNumberBuffers):
                 buf = buffers.mBuffers[index]
                 if not buf.mData or not buf.mDataByteSize:
@@ -299,9 +389,19 @@ class Listener:
                     here = -value if value < 0 else value
                     if here > peak:
                         peak = here
+                    # Everything under BASS_HZ, where a kick keeps its
+                    # weight - the peaks above may be flat against the
+                    # ceiling of a mastered track, this is not.
+                    low += (value - low) * alpha
+                    low_here = low if low >= 0 else -low
+                    if low_here > bass:
+                        bass = low_here
+            self._lowpass = low
             with self.lock:
                 if not self.fresh or peak > self.level:
                     self.level = peak
+                if not self.fresh or bass > self.bass:
+                    self.bass = bass
                 self.fresh = True
         except Exception:
             pass
@@ -425,6 +525,24 @@ class _CoreAudio:
         if status or not agg.value:
             raise OSError(f"AudioHardwareCreateAggregateDevice {_fourcc(status)}")
         return agg.value
+
+    def sample_rate(self, device):
+        """The device's nominal sample rate, or 0 when it will not say.
+
+        Asked of the aggregate rather than of the hardware, because the
+        aggregate is what the IOProc gets its frames from - and it is a
+        plain read, guarded by the caller, so a device that answers
+        oddly costs only the default 48kHz band split.
+        """
+        address = Address(NOMINAL_RATE, GLOBAL_SCOPE, 0)
+        size = ctypes.c_uint(8)
+        buf = ctypes.c_double()
+        status = self.lib.AudioObjectGetPropertyData(
+            device, ctypes.byref(address), 0, None, ctypes.byref(size),
+            ctypes.byref(buf))
+        if status:
+            return 0.0
+        return buf.value
 
     def create_ioproc(self, agg, handler):
         """Register `handler`, returning (its ctypes handle, its id).

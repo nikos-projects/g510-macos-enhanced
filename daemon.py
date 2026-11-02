@@ -2023,8 +2023,8 @@ class Daemon:
             return
         if self.beat is None:
             return                              # the tap would not open
-        fresh, level = self.beat.poll(now)
-        if fresh and self.beat_detector.push(level, now):
+        fresh, level, bass = self.beat.poll(now)
+        if fresh and self.beat_detector.push(level, now, bass):
             amount, decay = beat.pulse_settings(block)
             self.pulse_amount = amount
             self.pulse_decay = decay
