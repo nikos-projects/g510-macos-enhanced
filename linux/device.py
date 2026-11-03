@@ -497,6 +497,19 @@ class G510:
             return False
         return bool(select.select([keys.fd], [], [], timeout)[0])
 
+    def fileno(self):
+        """The evdev descriptor to sleep on, or None when there is none.
+
+        The run loop waits on this beside the beat listener's pipe, so a
+        key and a buffer of music both wake it at once instead of at the
+        next redraw. `wait()` stays for callers that want the simpler
+        contract (and for the no-evdev fallback, which sleeps).
+        """
+        try:
+            return self._gaming_keys().fd
+        except OSError:
+            return None
+
     @staticmethod
     def carries_keystrokes(data):
         """True if this report contains what the user typed."""

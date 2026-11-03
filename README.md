@@ -15,8 +15,13 @@ with three additions:
   macOS keeps, with no permission to ask for.
 
 Everything else, including how the keyboard itself is driven, is unchanged.
-There is no Linux port here (yet): the upstream `linux/` tree and the Debian
-packaging are not part of this fork (yet).
+
+There **is** a Linux port in this fork, under `linux/`: the kernel's in-tree
+`hid-lg-g15` driver does the backlight, the M-key LEDs and the G-keys, and
+this adds the LCD, the bindings, macro recording and the same agent loop as
+the Mac build. It is packaged for Debian and Arch - see `LINUX.md` for what
+works, what cannot, and how to install it. The two builds share `daemon.py`,
+`config.py`, `cli.py` and the rest; `linux/_path.py` explains how.
 
 Logitech never shipped a driver for this keyboard that runs on Apple Silicon:
 the last Mac build of Logitech Gaming Software is 8.53.130 (June 2014, Intel

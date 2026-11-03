@@ -58,6 +58,33 @@ def _lowpass_alpha(hz, rate):
     """
     return 1.0 - math.exp(-2.0 * math.pi * hz / rate)
 
+
+def envelope(values, alpha, low):
+    """(peak, low-band peak, the filter's new state) for one run of samples.
+
+    The whole band split in one place, so the CoreAudio listener here and
+    the PulseAudio one on Linux (linux/beat.py) count a beat the same
+    way - a detector that meant two different things on two platforms
+    would be worse than no second detector at all. `low` is carried in
+    and out because a one-pole's memory *is* the filter: it has to
+    survive between buffers, or every buffer would start from silence
+    and the low band would read a kick as a step.
+    """
+    peak = 0.0
+    bass = 0.0
+    for value in values:
+        here = -value if value < 0 else value
+        if here > peak:
+            peak = here
+        # Everything under BASS_HZ, where a kick keeps its weight - the
+        # peaks above may be flat against the ceiling of a mastered
+        # track, this is not.
+        low += (value - low) * alpha
+        low_here = low if low >= 0 else -low
+        if low_here > bass:
+            bass = low_here
+    return peak, bass, low
+
 # How eager the detector is, 0 to 100. It is the one number of the five
 # worth putting on a menu: the gap and the two time constants are about
 # what a beat *is*, while this is about how hard you have to hit for the
@@ -385,17 +412,11 @@ class Listener:
                 frames = buf.mDataByteSize // 4      # float32
                 values = ctypes.cast(
                     buf.mData, ctypes.POINTER(ctypes.c_float * frames)).contents
-                for value in values:
-                    here = -value if value < 0 else value
-                    if here > peak:
-                        peak = here
-                    # Everything under BASS_HZ, where a kick keeps its
-                    # weight - the peaks above may be flat against the
-                    # ceiling of a mastered track, this is not.
-                    low += (value - low) * alpha
-                    low_here = low if low >= 0 else -low
-                    if low_here > bass:
-                        bass = low_here
+                here_peak, here_bass, low = envelope(values, alpha, low)
+                if here_peak > peak:
+                    peak = here_peak
+                if here_bass > bass:
+                    bass = here_bass
             self._lowpass = low
             with self.lock:
                 if not self.fresh or peak > self.level:

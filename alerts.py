@@ -8,12 +8,22 @@ the interruption is over that is what comes back - including whatever was
 picked by hand in the meantime.
 """
 import os
+import shutil
 import subprocess
+import sys
 import threading
 import time
 
-SOUND_DIR = "/System/Library/Sounds"
-AFPLAY = "/usr/bin/afplay"
+# macOS rings through afplay and its own sound set; everywhere else the
+# freedesktop sound set is the one that ships, and paplay (PulseAudio or
+# PipeWire) or pw-play plays it. Resolved per play rather than cached at
+# import: the tools can be installed after the agent starts, and a
+# missing one must cost a silent ring, not an exception.
+SOUND_DIR = ("/System/Library/Sounds" if sys.platform == "darwin"
+             else "/usr/share/sounds/freedesktop/stereo")
+SUFFIX = ".aiff" if sys.platform == "darwin" else ".oga"
+PLAYERS = (["/usr/bin/afplay"] if sys.platform == "darwin"
+           else ["paplay", "pw-play", "aplay"])
 
 
 def sound_path(name):
@@ -21,9 +31,39 @@ def sound_path(name):
     if not name:
         return None
     text = str(name)
-    candidate = text if os.path.isabs(text) else os.path.join(
-        SOUND_DIR, text if text.endswith(".aiff") else text + ".aiff")
-    return candidate if os.path.exists(candidate) else None
+    if os.path.isabs(text):
+        return text if os.path.exists(text) else None
+    if sys.platform == "darwin":
+        candidate = os.path.join(
+            SOUND_DIR, text if text.endswith(".aiff") else text + ".aiff")
+        return candidate if os.path.exists(candidate) else None
+    # Linux: the configured name is tried as it stands and as the two
+    # extensions the freedesktop set uses, so a user who writes
+    # "message-new-instant" or a full file name gets their sound. A
+    # macOS name like "Glass" resolves to nothing here, which is a
+    # silence rather than a wrong noise - and the config defaults are
+    # amended on Linux (linux/config.py) so the shipped setting works.
+    stem = text[:-4] if text.endswith((".oga", ".wav")) else text
+    for extension in (".oga", ".wav", ""):
+        candidate = os.path.join(SOUND_DIR, stem + extension)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def available_sounds():
+    """The names a `sound` setting may take, sorted, for the CLI's hint.
+
+    Empty when the directory is not there at all: a minimal container or a
+    server install has no sound theme, and the caller turns this into a
+    "try one of" line in the middle of a config edit, where a missing
+    directory would otherwise raise out of it.
+    """
+    try:
+        return sorted(name for name in os.listdir(SOUND_DIR)
+                      if not name.startswith("."))
+    except OSError:
+        return []
 
 
 def play_sound(name):
@@ -31,12 +71,17 @@ def play_sound(name):
     path = sound_path(name)
     if not path:
         return False
-    try:
-        subprocess.Popen([AFPLAY, path], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-    except OSError:
-        return False
-    return True
+    for player in PLAYERS:
+        command = [player] if os.path.isabs(player) else [player]
+        if not os.path.isabs(player) and not shutil.which(player):
+            continue
+        try:
+            subprocess.Popen([player, path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        return True
+    return False
 
 
 class Alerts:

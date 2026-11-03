@@ -49,4 +49,17 @@ DEFAULTS["indicators"] = {"numlock": "off", "scrolllock": "off"}
 # fire it. An empty mapping keeps cli.py's validation happy.
 DEFAULTS["game_switch"] = {}
 
+# macOS's Glass does not exist here: the freedesktop sound theme is what
+# ships, and it is the same set on Debian and Arch. A timer finishing wants a
+# completion chime and a notification wants a message, which is what these
+# two become. They are amended rather than left alone because alerts.py
+# resolves the name at play time and a name it cannot find is silence - a
+# setting copied from a Mac would ring on the Mac and do nothing here, with
+# nothing in the log to say why.
+#
+# Both names are files in /usr/share/sounds/freedesktop/stereo/, which
+# `g510 timer set sound <name>` lists when asked for one that is not there.
+DEFAULTS["timers"]["sound"] = "complete"
+DEFAULTS["notifications"]["sound"] = "message-new-instant"
+
 _shared.adopt(_root, globals())

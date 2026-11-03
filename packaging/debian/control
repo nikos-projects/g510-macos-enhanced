@@ -17,6 +17,9 @@ Depends: ${misc:Depends},
          python3-pil
 Recommends: playerctl,
             wtype,
+            pulseaudio-utils,
+            sound-theme-freedesktop,
+            libxkbcommon0,
             python3-pyside6.qtwidgets,
             python3-pyside6.qtsvg
 Description: userspace driver for the Logitech G510 keyboard
@@ -33,4 +36,7 @@ Description: userspace driver for the Logitech G510 keyboard
  .
  playerctl is used by the now-playing screen and wtype by bindings that type
  text on Wayland; both are optional and the features that need them are
- skipped when they are absent.
+ skipped when they are absent. pulseaudio-utils supplies the monitor tap the
+ beat detector listens through, sound-theme-freedesktop the default alert
+ sounds, and libxkbcommon0 the keymap that turns key positions into the
+ characters the menu types.

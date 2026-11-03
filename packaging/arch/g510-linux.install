@@ -1,0 +1,60 @@
+# The two things a package cannot do for the user, said out loud instead of
+# guessed at - the same pair of messages packaging/debian/postinst and
+# packaging/debian/prerm print, for the same reasons.
+
+_g510_udev_reload() {
+    # Apply the new rules to devices that are already plugged in. Without the
+    # trigger the keyboard would only become usable after a replug or a
+    # reboot. Both are best-effort: in a chroot or a container there is no
+    # udev running and neither has anything to do.
+    if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=hidraw --subsystem-match=leds || true
+    fi
+}
+
+_g510_plugdev_note() {
+    if ! getent group plugdev >/dev/null 2>&1; then
+        echo "g510-linux: there is no plugdev group on this system."
+        echo "  The udev rules fall back to it for sessions logind does not"
+        echo "  treat as active, and /dev/uinput needs it. Create it with:"
+        echo "    sudo groupadd -r plugdev"
+    fi
+
+    # Deliberately not `usermod -aG plugdev`. Membership of plugdev is what
+    # allows a process to open /dev/uinput and type into the session, which
+    # is a privilege worth granting on purpose rather than as a side effect
+    # of installing a package.
+    local user="${SUDO_USER:-}"
+    if [ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        user="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)" || user=""
+    fi
+    if [ -n "$user" ] && ! id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx plugdev; then
+        echo "g510-linux: $user is not in the plugdev group."
+        echo "  The display and the backlight will still work through logind's"
+        echo "  uaccess tag, but bindings that type keys or text need it:"
+        echo "    sudo usermod -aG plugdev $user"
+        echo "  Group changes take effect at the next login."
+    fi
+}
+
+post_install() {
+    _g510_udev_reload
+    _g510_plugdev_note
+    echo "g510-linux: start the agent as your own user, not as root:"
+    echo "    systemctl --user daemon-reload"
+    echo "    systemctl --user enable --now g510.service"
+}
+
+post_upgrade() {
+    _g510_udev_reload
+}
+
+pre_remove() {
+    # The agent runs in the user's session, so root cannot stop it from here
+    # without reaching into a session it does not own. Say what to run.
+    if [ -d /run/systemd/system ]; then
+        echo "g510-linux: if the agent is running, stop it as your own user:"
+        echo "    systemctl --user disable --now g510.service"
+    fi
+}

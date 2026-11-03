@@ -56,18 +56,32 @@ Everything the driver does not expose:
 
 ## Installing
 
-### From the .deb
+Both packages install the same tree: `/usr/bin/g510`, the modules under
+`/usr/share/g510-linux/`, the udev rule, the systemd user unit and the
+desktop file. The list of shared modules is read out of
+`packaging/debian/rules` by both build scripts, so the .deb and the Arch
+package cannot disagree about what the entry point imports.
 
-    packaging/build-deb.sh
-    sudo apt install ../g510-linux_0.1.0_all.deb
+### Debian, Ubuntu, Mint
 
-`apt` rather than `dpkg -i`, so the dependencies are pulled in with it. That
-puts the entry point at `/usr/bin/g510`, the modules under
+    ./packaging/build-deb.sh
+    sudo apt install ../g510-linux_0.1.1_all.deb
+
+`apt` rather than `dpkg -i`, so `python3-evdev`, `python3-pil` and the rest
+come with it. That puts the entry point at `/usr/bin/g510`, the modules under
 `/usr/share/g510-linux/`, the udev rule in `/lib/udev/rules.d/` and the user
 unit in `/usr/lib/systemd/user/`.
 
-Then, as yourself and not as root:
+### Arch, CachyOS, SteamOS
 
+    cd packaging/arch
+    makepkg -si
+
+`-s` pulls the dependencies (`python-evdev`, `python-pillow`).
+
+### Then, as yourself and not as root
+
+    systemctl --user daemon-reload
     systemctl --user enable --now g510.service
     journalctl --user -u g510 -f
 
@@ -143,14 +157,66 @@ per-app profiles, and the `app` screen - do nothing here. The banks (M1/M2/M3)
 cover most of what per-app profiles were used for, switched deliberately
 rather than inferred.
 
+## Two mechanisms macOS gives away
+
+### The beat detector listens through PulseAudio
+
+macOS hands the mix over through a CoreAudio process tap, which needs no
+setup. Linux has no free equivalent, but every PulseAudio *or* PipeWire system
+exposes the same idea as a monitor source: the bytes the default sink is about
+to play. `parec` reads one - the default sink's `.monitor`, found with
+`pactl get-default-sink` - and `linux/beat.py` turns it into the same two
+numbers the CoreAudio listener produces, through the shared `beat.envelope()`
+so a kick means the same thing on both platforms and the sensitivity knob
+means the same thing too.
+
+Needs `pulseaudio-utils` (Debian) or `libpulse` (Arch). Without it the agent
+logs one line naming the package and the backlight simply does not pulse; the
+rest of the agent is unaffected.
+
+### The menu takes the keyboard, and gives it back
+
+The panel has no arrow keys, so the menu borrows the keyboard's - and reading
+`/dev/input/event*` is not enough, because the compositor has read the key too
+by then. `linux/keytap.py` grabs the G510's typing keyboard exclusively
+(`EVIOCGRAB`) while a panel is open and writes everything the menu does not
+want straight back out through a uinput virtual keyboard. The grab only exists
+while a panel wants keys, and the kernel releases it the moment the process
+goes away, so a dead agent cannot leave a dead keyboard behind.
+
+**What this costs, stated plainly:** while a panel has been opened, a program
+reading the *physical* node directly - Steam Input, an evdev game - sees the
+virtual keyboard instead of the real one. The daemon is restarted (or a panel
+closed) to release it. Bindings that send key chords or typed text need write
+access to `/dev/uinput`, which is a real privilege: anything in the `plugdev`
+group can create a virtual keyboard and type into whatever has focus, and
+nothing downstream can tell those events from a real keypress.
+
+## What is missing, and why
+
+| Feature | Status | Why |
+| --- | --- | --- |
+| Per-app profiles, `app` screen | impossible here | Wayland gives an unprivileged client no way to read the focused window - see below |
+| Notification banners from other apps | not written yet | macOS reads its own notification store; D-Bus has `org.freedesktop.Notifications`, so a watcher can be written, it just has not been. `sync_watcher` is skipped rather than started - a reader that finds nothing, forever, is indistinguishable from one that is broken |
+| Joystick switch, Num/Scroll Lock LEDs | drives nothing | not reported by `hid-lg-g15`; the settings stay in the schema so a config copied between platforms still loads |
+| ISO/ANSI key swap | not applicable | XKB owns the layout; `g510 iso` says so |
+
+Everything else in the macOS build - the LCD and its screens (including
+timers, note, menu, message and Discord), bindings in three banks, macro
+record and replay, the beat pulse, the API, the link port, triggers,
+autoscreen, the Discord screen, the settings menu on the panel - is the same
+code running on the same config, with only the numbers underneath swapped.
+
 ## Layout
 
     linux/                  the Linux half: hardware, and this README
     linux/_path.py          the import model - read this first
+    linux/_shared.py        why shared modules are amended, not forked
     config.py daemon.py     shared with the macOS build
     ipc.py control.py       ...
     packaging/g510          the entry point, /usr/bin/g510 once installed
     packaging/debian/       the source package
+    packaging/arch/         the PKGBUILD and its install script
     packaging/udev/         the rules file
     packaging/systemd/      the user unit
 
@@ -160,4 +226,4 @@ through to the shared one. `linux/_path.py` explains it properly; the entry
 point sets up the same two paths in the same order.
 
 The macOS-only modules - the menu bar app, the window and its panes - are not
-shipped by the .deb, and neither is `setup.py` or `make-dmg.sh`.
+shipped by either package, and neither is `setup.py` or `make-dmg.sh`.

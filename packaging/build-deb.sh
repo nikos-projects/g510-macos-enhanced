@@ -50,8 +50,23 @@ if [ -n "$missing" ]; then
               "$stage/lib/udev/rules.d" "$stage/usr/lib/systemd/user" \
               "$stage/usr/share/doc/g510-linux" "$stage/DEBIAN"
 
-    for module in cli.py config.py control.py daemon.py ipc.py printer.py \
-                  refresh.py; do
+    # Read out of debian/rules rather than repeated here: this fallback and
+    # the debhelper path are two ways of building the same package, and a list
+    # copied between them is a list that eventually gets updated in only one
+    # - which is how the package came to ship seven of the nineteen modules
+    # the entry point imports and fail to start.
+    shipped="$(awk '
+        /^MODULES :=/ { grab = 1 }
+        grab {
+            raw = $0
+            sub(/^MODULES := /, "", raw)
+            cont = (raw ~ /\\$/)
+            sub(/[[:space:]]*\\$/, "", raw)
+            printf "%s ", raw
+            if (!cont) exit
+        }
+    ' "$HERE/debian/rules")"
+    for module in $shipped; do
         install -m 644 "$TOP/$module" "$share"
     done
     # Top-level *.py only, so linux/tests and __pycache__ stay out.

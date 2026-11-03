@@ -12,29 +12,40 @@
 TOP := $(CURDIR)/..
 SHARE := debian/g510-linux/usr/share/g510-linux
 
-# The shared, platform-independent half of the program. Everything else at the
-# repo root is either macOS-only or is replaced by a file in linux/, and
-# shipping it would mean the wrong one wins on sys.path.
+# The shared half of the program that the entry point actually reaches. The
+# list was produced by walking the imports from cli.py and daemon.py rather
+# than by eye: a module's own imports are followed, and where linux/ amends a
+# root module with _shared.load() the root one it loads is followed too. That
+# walk ends at nineteen files, which is why this is nineteen long.
 #
-#   config ipc refresh      plain data and helpers, no platform in them
-#   daemon                  the agent; the hardware under it swaps
-#   control printer         reached from the command line and the screens
-#   cli                     the command line itself
+#   config ipc printer refresh   plain data and helpers, no platform in them
+#   daemon cli control           the agent and the command line
+#   screens beat                 amended by linux/ for the numbers they read
+#   alerts                       amended for how a sound is played
+#   api autoscreen beat browse   the features the loop drives
+#   extern link menu notify      ...
+#   timers triggers              ...
 #
-# Deliberately absent, having followed the imports rather than the file list:
+# Deliberately absent, having followed the same walk rather than the file list:
 #
-#   device lcd actions      linux/ has its own
-#   recorder screens
-#   layout                  macOS-only: it asks Carbon which character each
-#                           positional keycode produces. Only the macOS
-#                           actions.py imports it; linux/actions.py does not.
-#   main                    the py2app bundle's one-executable dispatcher.
-#                           Nothing imports it, and its no-argument path opens
-#                           the menu bar app. /usr/bin/g510 calls cli directly.
-#   gui window widgets      macOS user interface
+#   device lcd actions recorder  linux/ has its own
+#   keytap                       linux/ has its own, and shipping the root one
+#                                would put `import Quartz` back on the import
+#                                path, which is what stopped the agent booting
+#   layout                       macOS-only: it asks Carbon which character
+#                                each positional keycode produces. Only the
+#                                macOS actions.py imports it; linux/actions.py
+#                                does not.
+#   main                         the py2app bundle's one-executable
+#                                dispatcher. Nothing imports it, and its
+#                                no-argument path opens the menu bar app.
+#                                /usr/bin/g510 calls cli directly.
+#   gui window widgets           macOS user interface
 #   pane_*
-#   setup.py make-dmg.sh    the macOS build
-MODULES := cli.py config.py control.py daemon.py ipc.py printer.py refresh.py
+#   badapple setup.py make-dmg.sh  the macOS build
+MODULES := alerts.py api.py autoscreen.py beat.py browse.py cli.py \
+           config.py control.py daemon.py extern.py ipc.py link.py menu.py \
+           notify.py printer.py refresh.py screens.py timers.py triggers.py
 
 %:
 	dh $@ --with python3

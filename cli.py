@@ -1264,7 +1264,7 @@ def _trigger_set(settings, block, args):
     else:
         if not alerts.sound_path(value):
             sys.exit(f"No system sound {value!r}. Try one of: "
-                     + ", ".join(sorted(os.listdir(alerts.SOUND_DIR)))[:200])
+                     + ", ".join(alerts.available_sounds())[:200])
         block[key] = value
     save_config(settings)
     reload_agent()
@@ -1434,8 +1434,7 @@ def cmd_timer(args):
         if key == "sound":
             if not alerts.sound_path(value):
                 sys.exit(f"No system sound {value!r}. Try one of: "
-                         + ", ".join(sorted(os.listdir(alerts.SOUND_DIR)
-                                            ))[:200])
+                         + ", ".join(alerts.available_sounds())[:200])
             block[key] = value
         else:
             block[key] = _seconds(value, key)

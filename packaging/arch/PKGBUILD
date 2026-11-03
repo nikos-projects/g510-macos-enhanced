@@ -1,0 +1,81 @@
+# Maintainer: Philipp Taubert <taubert.philipp2@gmail.com>
+#
+# Built straight from the checkout rather than from a release tarball: there
+# is no archive to fetch, so `source` is empty on purpose and package()
+# reaches back to the repository root through $startdir. Run it where it
+# sits:
+#
+#     cd packaging/arch && makepkg -si
+#
+# The list of shared modules is read out of packaging/debian/rules rather
+# than repeated here, for the same reason packaging/build-deb.sh reads it:
+# one list, one place to change it, and no way for the Debian and Arch
+# packages to disagree about what the entry point imports. Getting that
+# wrong once is what left the .deb shipping seven of the nineteen modules
+# the agent needs and unable to start at all.
+pkgname=g510-linux
+pkgver=0.1.1
+pkgrel=1
+pkgdesc="userspace driver for the Logitech G510 keyboard"
+arch=('any')
+url="https://github.com/nikos-projects/g510-macos-enhanced"
+license=('GPL-3.0-or-later')
+depends=('python' 'python-evdev' 'python-pillow')
+optdepends=(
+  'playerctl: the now-playing screen'
+  'wtype: bindings that type text on Wayland'
+  'libpulse: the beat detector (parec, pactl, paplay)'
+  'sound-theme-freedesktop: the default alert sounds'
+  'libxkbcommon: the keymap that turns key positions into the characters the menu types'
+  'python-pyside6: the settings window'
+)
+provides=('g510')
+options=('!strip' '!emptydirs')
+# Matches $pkgname, but named out loud rather than left for makepkg to guess.
+install=g510-linux.install
+source=()
+sha256sums=()
+
+package() {
+  local top="$startdir/../.."
+  local share="$pkgdir/usr/share/g510-linux"
+
+  install -d "$share" "$share/linux"
+
+  # The shared half, exactly as debian/rules ships it.
+  local shipped module
+  shipped="$(awk '
+      /^MODULES :=/ { grab = 1 }
+      grab {
+          raw = $0
+          sub(/^MODULES := /, "", raw)
+          cont = (raw ~ /\\$/)
+          sub(/[[:space:]]*\\$/, "", raw)
+          printf "%s ", raw
+          if (!cont) exit
+      }
+  ' "$top/packaging/debian/rules")"
+  for module in $shipped; do
+    install -m 644 "$top/$module" "$share/"
+  done
+
+  # Top-level linux/*.py only, so linux/tests, linux/examples and
+  # __pycache__ stay out of the package.
+  local file
+  for file in "$top"/linux/*.py; do
+    install -m 644 "$file" "$share/linux/"
+  done
+
+  install -Dm755 "$top/packaging/g510" "$pkgdir/usr/bin/g510"
+  install -Dm644 "$top/packaging/udev/99-g510.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/99-g510.rules"
+  install -Dm644 "$top/packaging/systemd/g510.service" \
+    "$pkgdir/usr/lib/systemd/user/g510.service"
+  install -Dm644 "$top/packaging/g510.desktop" \
+    "$pkgdir/usr/share/applications/g510.desktop"
+  # The unit's Documentation= points here, so the path has to match.
+  install -Dm644 "$top/linux/README.md" \
+    "$pkgdir/usr/share/doc/g510-linux/README.md"
+  install -Dm644 "$top/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -296,27 +296,75 @@ USAGE = """g510 - control a Logitech G510 keyboard on Linux
   g510 info                     device, interfaces, current state
   g510 color [colour]           show or set the backlight (#rrggbb or a name)
   g510 brightness [0-100]       show or set backlight brightness
+  g510 beat [on|off] [amount N] [decay S] [sensitivity N]   pulse the backlight on the beat
+  g510 api [on|off] [port N]        the API other programs hook into
   g510 poweron <colour>         colour the keyboard powers on with
   g510 mkeys [m1 m2 m3 mr]      light M-key LEDs (no args clears them)
   g510 watch [--raw]            print G-key presses live
 
   g510 lcd <screen>             one screen: status clock claude media
-                                printer gauge gkeys
+                                printer gauge gkeys timers discord
   g510 lcd text "a" "b" "c"     draw up to 3 lines of text
   g510 lcd clear                blank the display
   g510 next                     step to the next screen in the cycle
+  g510 menu [open|close]        the settings menu on the panel
+  g510 menu key <name>          press a key in it: up down left right enter esc
+  g510 note [text|clear]        a sticky note on the panel (3x press of L5)
+
+  g510 autoscreen               what the rules see, and what they would pick
+  g510 autoscreen on|off        switch screens by activity, or stop doing it
+  g510 autoscreen freeze|unfreeze   hold the screen where it is, or let go
+  g510 autoscreen rules         the rules, in the order they are tried
+  g510 autoscreen add <name> <screen> key=value...   add a rule
+  g510 autoscreen del <name>    drop one; move <name> up|down reorders it
+  g510 autoscreen games [...]   which apps count as games (and nogames ...)
+  g510 autoscreen set <key> <value>   idle_seconds hold_seconds fallback
+
+  g510 trigger                 the causes you wrote yourself
+  g510 trigger on|off          watch for them, or stop watching
+  g510 trigger add <name> <screen> [seconds=N] key=value...   add one
+  g510 trigger del <name>      drop one
+  g510 trigger fire <name>     set one off now (a script can too)
+  g510 trigger set <key> <val> check_seconds sound
+
+  g510 timer                   what is counting down, and the presets
+  g510 timer start <10m|name>  start one (a preset name or a length of time)
+  g510 timer cancel <n|all>    stop one
+  g510 timer preset <name> <d> teach a name like "pomodoro" a length of time
+  g510 timer set <key> <val>   show_seconds ack_seconds sound
+  g510 timer on|off            let keys start timers at all
+
+  g510 discord                 read the channel the chat app has open
+  g510 discord on|off          show new messages on the display, or not
+  g510 discord apps            which apps are looked for
+  g510 discord set <key> <val> poll_seconds show_seconds sound apps
+                               banners banners_seconds
+  g510 discord channels        what the Discord client has (Vencord plugin)
+  g510 discord history [n]     the last n lines of the open channel
+  g510 discord older [n]       fetch n more lines of history
+  g510 discord open <name>     switch the client: a channel, a DM, or
+                               "friends" for the DM list itself
+  g510 discord say <text>      send it in the channel the client has open
+  g510 discord reply <#ref|last> <text>
+                               send it as a reply to one message; the
+                               #ref is what history prints beside it
+  g510 discord browse [on|off] give the panel's keys to the Discord
+                               screen: arrows pick channels and messages,
+                               enter answers, esc gives the keys back
 
   g510 bank [1|2|3]             show or switch the binding bank (M1/M2/M3)
   g510 printer [host|off]       3D printer the display reads from
   g510 claude [rows...]         which usage windows the Claude screen shows
   g510 bindings                 list G-key bindings for the active bank
-  g510 bind G1 app firefox      bind a key: app | keys | shell | text | none
+  g510 bind G1 app firefox      bind a key: app | keys | shell | text |
+                               timer | none
   g510 record G5 [name]         record a keystroke macro onto a G-key
   g510 macros [delete <name>]   list or remove recorded macros
   g510 profile "App" G1 ...     per-app binding overrides
   g510 config                   path to the config file
   g510 permissions              check access to /dev/uinput and /dev/input
   g510 verify                   check the key mapping against the markings
+  g510 iso                      explain why there is nothing to swap
   g510 gauge add <label> <cmd>  a bar fed by any command printing a number
   g510 install                  put the g510 command on your PATH
 
@@ -326,11 +374,21 @@ USAGE = """g510 - control a Logitech G510 keyboard on Linux
 
 colours: """ + ", ".join(sorted(config.NAMED_COLORS))
 
-# `switch` and `leds` are dropped from the usage rather than the command
-# table: the commands still parse and still edit the config, they just drive
-# nothing here. The joystick switch is not reported by hid-lg-g15, and the
-# lock LEDs belong to the kernel and the desktop, so device.LockLeds is a
-# no-op. Listing them would be advertising two dead ends.
+# The command table is inherited whole: every one of these commands edits the
+# config and talks to the daemon over the control socket, and neither knows
+# what platform it is on. What differs is only the platform's own lines.
+#
+#   permissions   names uinput and /dev/input rather than Accessibility and
+#                 Input Monitoring
+#   start         systemd rather than launchd
+#   iso           exists to explain that XKB owns the layout here
+#   bind          offers `timer` as well as `none` - both are config-backed
+#                 and work identically
+#   switch, leds  dropped from the usage rather than the command table: they
+#                 still parse and still edit the config, they just drive
+#                 nothing here. The joystick switch is not reported by
+#                 hid-lg-g15 and the lock LEDs belong to the kernel and the
+#                 desktop, so listing them would be advertising two dead ends.
 
 
 def cmd_iso(args):
@@ -351,6 +409,38 @@ def cmd_iso(args):
 
 
 COMMANDS["iso"] = cmd_iso
+
+
+def cmd_permissions(_args):
+    """Report and request the device access the bindings need.
+
+    The root version prints macOS's two permission names, which mean nothing
+    here - on Linux both questions are about file access to a device node,
+    and the answer comes from opening the node rather than from a prompt that
+    may or may not be approved. The advice itself lives in
+    actions.request_post_access(), which is the one place the shared command
+    gives us to speak.
+    """
+    reading = actions.can_read_input()
+    posting = actions.can_post_events()
+    print(f"  /dev/input   {'readable' if reading else 'NOT readable'}"
+          "   (reading the G-keys)")
+    print(f"  /dev/uinput  {'writable' if posting else 'NOT writable'}"
+          "   (keys, text and macro bindings)")
+    if reading and posting:
+        print("\nBoth available - every binding type will work.")
+        return
+    if not posting:
+        print("\nWithout /dev/uinput, 'keys', 'text' and macro bindings do")
+        print("nothing. 'app' and 'shell' bindings work regardless.")
+        actions.request_post_access()
+    if not reading:
+        print("\nWithout /dev/input the G-keys cannot be read at all, so no")
+        print("binding fires. The packaged udev rule grants it to the seat;")
+        print("see linux/README.md if it is not taking effect.")
+
+
+COMMANDS["permissions"] = cmd_permissions
 
 _root.USAGE = USAGE
 
