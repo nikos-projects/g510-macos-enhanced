@@ -29,7 +29,7 @@ attribute names you will meet depending on the kernel.
 ### Debian, Ubuntu, Mint
 
     ./packaging/build-deb.sh
-    sudo apt install ../g510-linux_0.1.1_all.deb
+    sudo apt install ./g510-linux_*.deb
 
 `apt` rather than `dpkg -i`, so `python3-evdev`, `python3-pil` and the rest
 come with it.

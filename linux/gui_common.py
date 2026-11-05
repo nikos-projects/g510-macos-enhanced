@@ -29,8 +29,11 @@ def guard(work, *args, **kwargs):
 try:
     from PySide6.QtCore import QObject, Signal
 except ImportError as exc:                    # pragma: no cover - import guard
+    # Both families named, since this can surface from any entry point
+    # that imports a pane - an apt line on Arch installs nothing at all.
     raise ImportError(
-        "The GUI needs PySide6: apt install python3-pyside6.qtwidgets") from exc
+        "The GUI needs PySide6 (apt install python3-pyside6.qtwidgets "
+        "/ pacman -S pyside6)") from exc
 
 
 class Bus(QObject):

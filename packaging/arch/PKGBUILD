@@ -14,7 +14,7 @@
 # wrong once is what left the .deb shipping seven of the nineteen modules
 # the agent needs and unable to start at all.
 pkgname=g510-linux
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="userspace driver for the Logitech G510 keyboard"
 arch=('any')
@@ -27,7 +27,11 @@ optdepends=(
   'libpulse: the beat detector (parec, pactl, paplay)'
   'sound-theme-freedesktop: the default alert sounds'
   'libxkbcommon: the keymap that turns key positions into the characters the menu types'
-  'python-pyside6: the settings window'
+  # Arch calls it pyside6; Debian's python3-pyside6.qtwidgets is the same
+  # bindings under the other family's naming. Checked against the repo
+  # rather than carried across: an optdepend with no package behind it is
+  # a name that silently installs nothing.
+  'pyside6: the settings window'
 )
 provides=('g510')
 options=('!strip' '!emptydirs')

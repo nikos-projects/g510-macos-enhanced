@@ -270,8 +270,13 @@ def cmd_gui(args):
     try:
         import gui
     except ImportError as exc:
+        # Both families named, the way the beat tap names its own package:
+        # this file runs on either, and an apt line on Arch installs
+        # nothing at all.
         sys.exit(f"{exc}\n"
-                 "  apt install python3-pyside6.qtwidgets python3-pyside6.qtsvg")
+                 "  Debian: apt install python3-pyside6.qtwidgets "
+                 "python3-pyside6.qtsvg\n"
+                 "  Arch:   pacman -S pyside6")
     sys.exit(gui.main(args))
 
 
