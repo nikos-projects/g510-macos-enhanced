@@ -330,6 +330,18 @@ class ModuleTests(unittest.TestCase):
         self.assertIs(lcd.LCD_WIDTH, device.LCD_WIDTH)
         self.assertIs(lcd.LCD_HEIGHT, device.LCD_HEIGHT)
 
+    def test_the_configured_font_is_what_the_default_draws_with(self):
+        """`lcd.font` reaches the panel through set_font, which the shared
+        agent calls on __init__ and on every reload - the same entry point
+        the macOS lcd exports, so shared code never asks which platform it
+        is on. A name FreeType cannot open still draws, in DejaVu."""
+        self.addCleanup(lcd.set_font, lcd.DEFAULT_FONT)
+        lcd.set_font("Menlo-Bold")        # the config's default, not a file
+        self.assertEqual(lcd.FONT, "Menlo-Bold")
+        self.assertGreater(Canvas().measure("hello"), 0)
+        lcd.set_font("")                  # empty falls back, not to nothing
+        self.assertEqual(lcd.FONT, lcd.DEFAULT_FONT)
+
 
 if __name__ == "__main__":
     unittest.main()

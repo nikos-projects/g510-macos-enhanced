@@ -259,6 +259,14 @@ def cmd_gui(args):
     working on a machine with no Qt on it. PySide6 is a Recommends, not a
     Depends, because the agent and the CLI have no use for it.
     """
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # Qt's own answer to this is a page of plugin diagnostics ending in
+        # "Aborted"; the question is only whether there is a desktop session
+        # to open a window in. Asked before Qt is even imported, so an ssh
+        # login does not pay for loading it either.
+        sys.exit("no display to open - g510 gui wants a desktop session "
+                 "(X11 or Wayland).\n  Over ssh there is none; the agent and "
+                 "the command line work without one.")
     try:
         import gui
     except ImportError as exc:
@@ -421,9 +429,15 @@ def cmd_permissions(_args):
     actions.request_post_access(), which is the one place the shared command
     gives us to speak.
     """
+    node = actions.input_node()
     reading = actions.can_read_input()
+    # can_read_input() is "is there a node, and may we open it", so a board
+    # that is not plugged in answers exactly like one we may not open - and
+    # only the second is a permissions problem to go and fix.
+    state = ("no keyboard node" if node is None
+             else "readable" if reading else "NOT readable")
     posting = actions.can_post_events()
-    print(f"  /dev/input   {'readable' if reading else 'NOT readable'}"
+    print(f"  /dev/input   {state}"
           "   (reading the G-keys)")
     print(f"  /dev/uinput  {'writable' if posting else 'NOT writable'}"
           "   (keys, text and macro bindings)")
@@ -435,9 +449,14 @@ def cmd_permissions(_args):
         print("nothing. 'app' and 'shell' bindings work regardless.")
         actions.request_post_access()
     if not reading:
-        print("\nWithout /dev/input the G-keys cannot be read at all, so no")
-        print("binding fires. The packaged udev rule grants it to the seat;")
-        print("see linux/README.md if it is not taking effect.")
+        if node is None:
+            print("\nThere is no keyboard event node, so there is nothing")
+            print("to read: the board is not plugged in, or hid-lg-g15 has")
+            print("not bound. Access is only the question once it is there.")
+        else:
+            print("\nWithout /dev/input the G-keys cannot be read at all, so no")
+            print("binding fires. The packaged udev rule grants it to the seat;")
+            print("see linux/README.md if it is not taking effect.")
 
 
 COMMANDS["permissions"] = cmd_permissions

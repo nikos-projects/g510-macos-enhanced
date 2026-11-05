@@ -22,6 +22,23 @@ PREVIEW_DARK = (28, 26, 22)
 
 _font_cache = {}
 
+# What the config asked for; `lcd.font`. The macOS build asks for a family
+# name and this one is handed a path as often as not, so `_load_font` is
+# what decides what either of those means - all this holds is the choice.
+FONT = DEFAULT_FONT
+
+
+def set_font(name):
+    """Draw everything from now on with this font - the config's `lcd.font`.
+
+    An empty or unknown name falls back to the default rather than to
+    nothing: a panel with no text on it is worse than one in the wrong face.
+    Shared code - daemon.__init__ and every reload - calls this on both
+    platforms, so the Linux lcd owes it the name the macOS one has.
+    """
+    global FONT
+    FONT = str(name or "").strip() or DEFAULT_FONT
+
 
 def _load_font(name, size):
     """A Pillow face for (name, size), loaded once.
@@ -29,6 +46,8 @@ def _load_font(name, size):
     A frame is a dozen text and measure calls and the daemon redraws every
     second; opening a FreeType face that often is pure waste.
     """
+    if name is None:
+        name = FONT          # what the config asked for, unless told else
     key = (name, round(float(size), 2))
     cached = _font_cache.get(key)
     if cached is not None:
@@ -75,7 +94,7 @@ class Canvas:
     def clear(self):
         self.draw.rectangle([0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1], fill=0)
 
-    def text(self, string, x, y, size=12.0, font=DEFAULT_FONT):
+    def text(self, string, x, y, size=12.0, font=None):
         """Draw a string with its baseline at (x, y), measured from the top.
 
         macOS hands CoreGraphics the bottom-left point (x, LCD_HEIGHT-y-size),
@@ -93,12 +112,12 @@ class Canvas:
             # the closest thing to the em box top we can ask for.
             self.draw.text((x, y), string, fill=255, font=face)
 
-    def centered(self, string, y, size=12.0, font=DEFAULT_FONT):
+    def centered(self, string, y, size=12.0, font=None):
         """Draw a string horizontally centred, baseline y from the top."""
         width = self.measure(string, size, font)
         self.text(string, max(0, (LCD_WIDTH - width) / 2), y, size, font)
 
-    def measure(self, string, size=12.0, font=DEFAULT_FONT):
+    def measure(self, string, size=12.0, font=None):
         """Width in pixels the string will occupy."""
         face = _load_font(font, size)
         try:

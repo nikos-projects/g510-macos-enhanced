@@ -36,6 +36,13 @@ import sqlite3
 import threading
 import time
 
+# Whether this platform has the two sources this module reads. The shared
+# daemon asks it before starting the watcher and the CLI asks it before
+# reading either source: on Linux `import notify` gets linux/notify.py,
+# which is this name with nothing behind it, and a reader that finds
+# nothing is indistinguishable from one that is broken.
+AVAILABLE = True
+
 DEFAULT_APPS = (
     "dev.vencord.vesktop",
     "com.hnc.Discord",

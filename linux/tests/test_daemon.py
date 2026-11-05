@@ -140,6 +140,20 @@ class Boot(unittest.TestCase):
             self.assertNotIn(name, stub.calls)
 
 
+class SyncWatcher(unittest.TestCase):
+    def test_the_shared_reload_path_starts_no_watcher(self):
+        """_boot skips sync_watcher, but reload_config() is shared code
+        and calls it on every reload - the path every `g510 config set`
+        takes. There is no source on Linux, so the guard has to live inside
+        sync_watcher itself: skipping it only at boot would leave that one
+        free to start a reader that finds nothing, forever."""
+        stub = Loop(config={"notifications": {"enabled": True}})
+        with mock.patch.object(daemon.notify, "Watcher", create=True) as made:
+            Daemon.sync_watcher(stub)
+        made.assert_not_called()
+        self.assertFalse(hasattr(stub, "watcher"))
+
+
 class NextRedraw(unittest.TestCase):
     def test_a_disabled_display_never_parks_the_loop(self):
         """The cap exists so a config that turns the LCD off cannot leave

@@ -11,8 +11,11 @@ descriptor: a listener whose pipe did not carry a byte would still count
 beats, just up to a second late, which for a beat is the same as not at all.
 """
 import os
+import re
 import select
+import shutil
 import struct
+import subprocess
 import time
 import unittest
 from unittest import mock
@@ -148,6 +151,41 @@ class StartFailure(unittest.TestCase):
             self.assertTrue(any("beat tap" in line for line in logged))
         finally:
             listener.stop()
+
+
+class SpawnedCommand(unittest.TestCase):
+    """What parec is asked for, against what parec actually has.
+
+    The tap's one hard dependency: an option parec rejects makes it exit
+    at once, and with stderr in /dev/null the only sign is a listener that
+    never hears anything. `--no-shm` was exactly that, and no test caught
+    it because none of them had ever run parec.
+    """
+
+    def test_every_option_is_one_parec_offers(self):
+        parec = shutil.which("parec")
+        if parec is None:
+            self.skipTest("parec is not installed")
+        done = subprocess.run([parec, "--help"], capture_output=True,
+                              text=True)
+        offered = set(re.findall(r"--[a-z][a-z-]*",
+                                 done.stdout + done.stderr))
+        self.assertTrue(offered, "parec --help listed no long options")
+        for option in beat.parec_command(parec, "auto_null"):
+            if option.startswith("--"):
+                self.assertIn(option.split("=", 1)[0], offered,
+                              f"parec has no {option.split('=', 1)[0]}: "
+                              "the tap would die at once")
+
+    def test_it_asks_for_the_format_the_reader_unpacks(self):
+        """consume() reads float32le mono, so anything else would be
+        samples read at the wrong width or interleaved - beats counted
+        against garbage."""
+        asked = beat.parec_command("parec", "auto_null")
+        self.assertIn("--format=float32le", asked)
+        self.assertIn("--channels=1", asked)
+        self.assertIn(f"--rate={int(beat.RATE)}", asked)
+        self.assertIn("--device=auto_null.monitor", asked)
 
 
 if __name__ == "__main__":

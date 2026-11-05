@@ -1448,6 +1448,16 @@ def cmd_timer(args):
 def _discord_read(block, count=3):
     """One read of the channel the chat app has open, printed."""
     import notify
+    if not notify.AVAILABLE:
+        # A chat window is read off its Accessibility tree, which Wayland
+        # will not hand an unprivileged client - the same wall that rules
+        # out per-app profiles (LINUX.md). The chat still reaches the
+        # panel here, through the Vencord plugin over the link port.
+        print("  window     not read on Linux - a chat window is a "
+              "macOS-only source")
+        print("             the Vencord plugin reads chat here: "
+              "g510 discord channels")
+        return
     found = notify.probe(block, count=count)
     trusted = found.get("trusted")
     print(f"  access     {'granted' if trusted else 'missing'}")
@@ -1483,6 +1493,13 @@ def _banners_status(block):
     asks the store once for whether it can be read at all.
     """
     import notify
+    if not notify.AVAILABLE:
+        # macOS keeps a store of everything it was told and this reads it
+        # back; a Linux desktop hands each notification to the session and
+        # keeps no history for an agent to read.
+        print("  banners    not read on Linux - there is no notification "
+              "store to read")
+        return
     if not block.get("enabled", True):
         # One switch stands for the whole channel: both sources are read by
         # the same watcher, so saying "banners on" here would be a lie.
@@ -1704,10 +1721,16 @@ def cmd_discord(args):
         print(f"notifications {key} -> {block[key]}")
         return
     if head == "apps":
+        import notify
+        if not notify.AVAILABLE:
+            # The list is what the macOS window reader looks for, and there
+            # is no window to read here (linux/notify.py).
+            print("  apps       not looked for on Linux - the window "
+                  "reader is macOS-only")
+            return
         print("  looking for:")
         for name in block.get("apps") or []:
             print(f"    {name}")
-        import notify
         pid, name = notify.find_app(block.get("apps") or notify.DEFAULT_APPS)
         print(f"  running:   {name if name else 'none of them'}")
         return

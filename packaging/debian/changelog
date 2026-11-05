@@ -1,3 +1,33 @@
+g510-linux (0.1.2) trixie; urgency=low
+
+  * Ship linux/notify.py. The shared daemon imports notify at load time, and
+    without the Linux copy that import opened macOS's own frameworks, so
+    `g510 run` died before it reached the loop. sync_watcher and the three
+    `g510 discord` readers now ask the new notify.AVAILABLE flag first, and
+    say what cannot be read here rather than reading nothing.
+  * Give linux/lcd.py the set_font() that shared code calls for `lcd.font`.
+    Without it `g510 run` died in __init__ on the way to the loop, and the
+    setting now reaches the panel here: a path is opened as a font file, and
+    a macOS family name falls back to DejaVu, which is what _load_font
+    already expected.
+  * Take `reload` out from behind the keyboard gate. It reached the agent
+    only when a G510 was plugged in, so with none attached every `g510`
+    setting was saved and reported as applied while the agent kept running
+    what it had read at boot - which is also how the beat tap gets opened
+    here, where there is no keyboard to wait for.
+  * Drop --no-shm from the parec call. No parec has ever had that option,
+    so the beat tap exited at once on every machine and, with stderr in
+    /dev/null, all that showed was a listener that heard nothing. The
+    command is built in one place now, and a test holds its options
+    against what `parec --help` actually offers.
+  * Say what is really missing in `g510 permissions` and `g510 gui` on a
+    box that has neither. No keyboard node is the board not being plugged
+    in, not a permissions problem to go and fix; no display is one line
+    rather than Qt's page of plugin diagnostics ending in Aborted - and it
+    is asked before Qt is imported, so an ssh login does not pay for it.
+
+ -- nikossrcs2 <taubert.philipp2@gmail.com>  Wed, 04 Nov 2026 20:15:46 +0100
+
 g510-linux (0.1.1) trixie; urgency=low
 
   * Sleep on the keyboard's evdev descriptor instead of polling it every four

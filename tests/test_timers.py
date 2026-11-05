@@ -640,6 +640,17 @@ class AgentCommandTests(unittest.TestCase):
         self.assertIsNone(self.agent.keyboard)
         self.assertTrue(self.ask(action="start", value="5m")["ok"])
 
+    def test_a_reload_works_with_the_keyboard_unplugged(self):
+        # Every change the shell makes reaches the agent as this one
+        # command, so gating it on the keyboard would leave the agent on the
+        # config it read at boot while the keyboard is unplugged - and the
+        # shell has already saved the file and printed the change as made.
+        self.assertIsNone(self.agent.keyboard)
+        with mock.patch.object(daemon.Daemon, "reload_config") as reloaded:
+            reply = self.ask(cmd="reload")
+        self.assertTrue(reply["ok"])
+        reloaded.assert_called_once_with()
+
     def test_the_chat_reader_follows_the_config(self):
         # The reader itself is left out of it: starting one here would hold a
         # real chat app's window open for the length of the test.

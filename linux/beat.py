@@ -47,6 +47,20 @@ CHUNK_FRAMES = 1024     # ~21ms of audio, the same order as a CoreAudio buffer
 CHUNK_BYTES = CHUNK_FRAMES * 4     # float32, mono
 
 
+def parec_command(parec, sink):
+    """The parec invocation, as one list.
+
+    Kept apart from the call so a test can hold it against what `parec
+    --help` really offers. It used to pass `--no-shm`, which no parec has
+    ever had: parec rejected it and exited at once, so the tap died on
+    every machine rather than only the odd one - and because stderr went
+    to /dev/null, all that showed was a listener that heard nothing.
+    """
+    return [parec, f"--device={sink}.monitor",
+            "--format=float32le", f"--rate={int(RATE)}",
+            "--channels=1", "--latency=50ms"]
+
+
 class Listener:
     """The monitor source, as two numbers per buffer.
 
@@ -107,9 +121,7 @@ class Listener:
             return False
         try:
             self._proc = subprocess.Popen(
-                [parec, f"--device={sink}.monitor",
-                 "--format=float32le", f"--rate={int(RATE)}",
-                 "--channels=1", "--latency=50ms", "--no-shm"],
+                parec_command(parec, sink),
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError as exc:
             self.error = f"parec could not be started: {exc}"

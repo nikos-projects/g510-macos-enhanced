@@ -313,7 +313,15 @@ class Daemon:
         Both of them live in this one watcher - the window reader and the
         store reader - so the switch is the whole alerts channel's, not one
         source's.
+
+        On a platform with no source at all (linux/notify.py) there is
+        nothing to follow, so this leaves `self.watcher` alone. The check
+        is here rather than in the boot that skips this call on Linux
+        because reload_config() reaches here on every reload, which is the
+        path every `g510 config set` takes.
         """
+        if not notify.AVAILABLE:
+            return
         block = self.config.get("notifications") or {}
         wanted = bool(block.get("enabled", True))
         if wanted and self.watcher is None:
@@ -495,6 +503,15 @@ class Daemon:
             # The freeze lives here, not in the config file, so this is the
             # only place that can answer for it.
             return self.autoscreen_command(payload)
+        if command == "reload":
+            # Re-read the config, which needs the agent and not the
+            # keyboard: everything reload_config writes is guarded by the
+            # keyboard being there. Gating it below would leave the agent
+            # running the config it read at boot for as long as the
+            # keyboard is unplugged - and the shell, which has already
+            # saved the file and printed the change as made, would be
+            # telling the truth the agent is not keeping.
+            return {"ok": True, "deferred": "reload"}
         with self.lock:
             if self.keyboard is None:
                 return {"ok": False, "error": "keyboard not connected"}
@@ -531,8 +548,6 @@ class Daemon:
                 return {"ok": True,
                         "manufacturer": self.keyboard._dev.get_manufacturer_string(),
                         "product": self.keyboard._dev.get_product_string()}
-            if command == "reload":
-                return {"ok": True, "deferred": "reload"}
             if command == "next_screen":
                 return {"ok": True, "deferred": "next_screen"}
             if command == "set_bank":
